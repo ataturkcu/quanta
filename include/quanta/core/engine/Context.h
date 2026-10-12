@@ -30,6 +30,7 @@ class Error;
 class ExecContextScope;
 
 class Context {
+    friend struct JitEnvLayout;   // the baseline JIT reads lexical_environment_ directly
 public:
     enum class Type {
         Global,

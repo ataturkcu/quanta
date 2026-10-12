@@ -175,6 +175,7 @@ public:
     void movq_to_xmm(Xmm x, Reg r) { byte(0x66); rex(true, x >> 3, 0, r >> 3); byte(0x0F); byte(0x6E); modrm_rr(static_cast<Reg>(x), r); }
     void movq_from_xmm(Reg r, Xmm x) { byte(0x66); rex(true, x >> 3, 0, r >> 3); byte(0x0F); byte(0x7E); modrm_rr(static_cast<Reg>(x), r); }
     void addsd(Xmm d, Xmm s) { sse(0xF2, 0x58, d, s); }
+    void addsd_mem(Xmm d, Mem m) { byte(0xF2); rex_rm(false, static_cast<Reg>(d), m); byte(0x0F); byte(0x58); modrm_mem(static_cast<Reg>(d), m); }
     void subsd(Xmm d, Xmm s) { sse(0xF2, 0x5C, d, s); }
     void mulsd(Xmm d, Xmm s) { sse(0xF2, 0x59, d, s); }
     void divsd(Xmm d, Xmm s) { sse(0xF2, 0x5E, d, s); }

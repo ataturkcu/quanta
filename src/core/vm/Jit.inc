@@ -9,35 +9,42 @@
 // the handler table) because it is built on the interpreter's own Frame and
 // handlers rather than beside them.
 //
-// What it is: a template compiler. Every bytecode instruction becomes a fixed
-// run of x86-64 and nothing is optimised across instructions. The register
-// file stays in Frame::regs (memory), and only the accumulator lives in a
-// machine register (r13), so there is nothing to reconcile with the
-// interpreter when the two hand a frame back and forth: the Frame *is* the
-// state, in both directions.
+// Why a template compiler that falls back to the interpreter, instead of a JIT
+// with its own implementation of every opcode: this engine has ~190 opcodes whose
+// handlers carry years of spec corner cases, and most of them (classes, private
+// names, spread, destructuring, eval, with, disposal scopes) are not hot. A second
+// implementation of each would be a second place for every conformance bug to
+// live. So the JIT translates only what it can prove inline and hands every other
+// instruction to the interpreter's own handler ("stepping"), on the very same
+// Frame. The Frame *is* the machine state in both directions (registers stay in
+// memory, only the accumulator is cached in r13), which is what makes switching
+// between the two at any instruction boundary free -- and also what makes
+// on-stack replacement and bailing out trivial.
 //
-// The design rule that keeps it small and safe: the JIT never re-implements a
-// semantic it is not sure about. An instruction it does not translate (most of
-// them) is *stepped* -- run by the interpreter's own handler, on the very same
-// Frame, for exactly that one instruction (see jit_step). An instruction it
-// does translate handles only the case it can prove inline (two finite
-// doubles, an Ordinary object whose shape matches the site's cache, ...), and
-// anything else branches to the same step, so a surprise is the interpreter's
-// answer, never a different one.
+// Why loops only, by default: what a template JIT removes is dispatch, which
+// multiplies in loops. A short method that is mostly property accesses and calls
+// spends its time in the call path and the runtime either way; compiling it only
+// adds instruction-cache pressure (measured: the code a function needs is ~25x
+// its bytecode, and a few dozen such functions no longer fit L1i, while the
+// interpreter's handlers are shared by every function).
 //
 // Memory safety, in the order the generated code could break it:
-//  * every register / constant / feedback / jump operand is range-checked
-//    while compiling; a chunk that fails any check is refused outright;
-//  * generated code only reads and writes Frame, the register bank, the
-//    chunk's constant pool, its own JitCode, and objects through checks the
-//    interpreter's inline-cache handlers make as well;
-//  * C++ exceptions never unwind through generated code (it has no unwind
-//    info): helpers catch everything and the trampoline rethrows after the
-//    native frame is gone;
+//  * every register / constant / name / jump operand is range-checked while
+//    compiling; a chunk that fails any check is refused outright;
+//  * generated code only reads and writes Frame, the register bank, the chunk's
+//    constant pool, its own JitCode, and objects through checks the interpreter's
+//    inline-cache handlers make as well;
+//  * C++ exceptions never unwind through generated code (it has no unwind info):
+//    helpers catch everything and the trampoline rethrows after the native frame
+//    is gone;
 //  * the GC is conservative and non-moving, so values in generated code are
-//    found on the C stack like any other -- and the accumulator is spilled to
-//    the Frame before every call out;
+//    found on the C stack like any other -- and the accumulator is spilled to the
+//    Frame before every call out;
 //  * code pages are written once and then flipped to read+execute.
+//
+// Register map while generated code runs:
+//   rbx Frame*   r12 register bank   r13 accumulator   r14 JitCode*
+//   r15 this code's inline caches    rbp finite-double limit (see finite_check)
 
 #if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
 #define QUANTA_JIT_X64 1
@@ -57,6 +64,8 @@ constexpr size_t kOffThisValue = offsetof(Frame, this_value);
 constexpr size_t kOffThisResolved = offsetof(Frame, this_resolved);
 constexpr size_t kOffCtx = offsetof(Frame, ctx);
 constexpr size_t kOffLookupCache = offsetof(Frame, lookup_cache_data);
+constexpr size_t kOffCallInfo = offsetof(Frame, call_info);
+constexpr size_t kOffCurLexEnv = offsetof(Frame, current_lexical_env);
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
@@ -80,6 +89,8 @@ constexpr uint64_t kTrueBits = static_cast<uint64_t>(kTopTrue) << kTagShift;
 constexpr uint64_t kUndefinedBits = static_cast<uint64_t>(kTopUndefined) << kTagShift;
 constexpr uint64_t kNullBits = static_cast<uint64_t>(kTopNull) << kTagShift;
 constexpr uint64_t kPayloadMask = 0x0000FFFFFFFFFFFFull;
+// 2 * bits >= this <=> the exponent field is all ones (not a finite double).
+constexpr uint64_t kFiniteLimit = 0xFFE0000000000000ull;
 
 inline uint64_t bits_of(const Value& v) { return std::bit_cast<uint64_t>(v); }
 inline uint64_t bits_of_double(double d) { return std::bit_cast<uint64_t>(d); }
@@ -99,6 +110,7 @@ struct Config {
     bool debug = false;           // stats || trace: the one flag the hot helpers test
     int32_t safepoint_reload = 64;
     uint32_t mode = 1;             // 1: functions with loops only (default), 0: any hot function
+    uint32_t max_slow_per_entry = 10;
     uint32_t threshold = 6;        // calls before a loop-free function is compiled
     const char* dump_dir = nullptr;
     size_t mapped_bytes = 0;
@@ -217,6 +229,7 @@ void init_once() {
     if (const char* s = std::getenv("QUANTA_JIT_TRACE")) g_cfg.trace = s[0] && s[0] != '0';
     if (const char* s = std::getenv("QUANTA_JIT_STATS")) g_cfg.stats = s[0] && s[0] != '0';
     if (const char* t = std::getenv("QUANTA_JIT_MODE")) g_cfg.mode = static_cast<uint32_t>(std::atoi(t));
+    if (const char* t = std::getenv("QUANTA_JIT_MAXSLOW")) g_cfg.max_slow_per_entry = static_cast<uint32_t>(std::atoi(t));
     if (const char* t = std::getenv("QUANTA_JIT_THRESHOLD")) g_cfg.threshold = static_cast<uint32_t>(std::atoi(t));
     if (const char* d = std::getenv("QUANTA_JIT_DUMP")) g_cfg.dump_dir = d;
     if (const char* m = std::getenv("QUANTA_JIT_LIMIT")) g_cfg.limit = static_cast<uint32_t>(std::atoi(m));
@@ -313,6 +326,7 @@ void learn_ic(Frame* f, JitCode* jc, uint32_t pc, uint32_t block) noexcept {
 // Returns the pc to continue at, or a kStep* code.
 int32_t step_impl(Frame* f, uint32_t pc, uint32_t len, uint32_t target, uint32_t ic_index) noexcept {
     JitCode* jc = f->chunk.jit.get();
+    jc->slow++;
     const uint32_t size = jc->code_size;
     if (__builtin_expect(g_cfg.debug, 0)) {
         if (g_cfg.stats) { g_cfg.steps[f->chunk.code[pc]]++; g_cfg.step_total++; note_site(f->chunk, pc); }
@@ -458,6 +472,7 @@ int32_t find_handler(const BytecodeChunk& chunk, uint32_t pc) noexcept {
 // minus the paths that call a getter (a call can throw and re-enter; the step
 // does those).
 int fast_get_named_impl(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
+    f->chunk.jit->slow++;
     if (__builtin_expect(g_cfg.debug && g_cfg.stats, 0)) {
         note_site(f->chunk, pc);
         if (g_cfg.trace && ic_index != kNoOperand && ic_index < f->chunk.jit->ics.size()) {
@@ -578,6 +593,7 @@ int fast_get_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
 // SetNamed beyond the monomorphic own-slot store: the other learned shapes and
 // the new-property transition cache (h_SetNamedFast / h_SetNamedRest).
 int fast_set_named_impl(Frame* f, uint32_t pc) noexcept {
+    f->chunk.jit->slow++;
     const uint8_t* code = f->chunk.code.data();
     const Value& receiver = f->regs[code[pc + 1]];
     const Value& acc = f->acc;
@@ -621,6 +637,7 @@ int fast_set_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
 
 // LdaLookup / LdaLookupStar: every cached form (h_LdaLookupFast).
 int fast_lookup(Frame* f, uint32_t pc) noexcept {
+    f->chunk.jit->slow++;
     const auto& entry = f->lookup_cache_data[read_u16(f->chunk.code.data(), pc + 1)];
     if (entry.shadow_epoch != Environment::binding_shadow_epoch()) return 0;
     if (entry.dict_desc) {
@@ -674,6 +691,7 @@ int fast_env_slot(Frame* f, uint32_t pc, uint32_t kind) noexcept {
 // SetKeyed's element stores (h_SetKeyedFast / h_SetKeyedElement): an in-range or
 // appending store to a dense array, and a typed-array number store.
 int fast_set_keyed(Frame* f, uint32_t pc) noexcept {
+    f->chunk.jit->slow++;
     const uint8_t* code = f->chunk.code.data();
     const Value& acc = f->acc;
     uint32_t index;
@@ -696,6 +714,7 @@ int fast_set_keyed(Frame* f, uint32_t pc) noexcept {
 // exception routing. `op` is the BinaryExpression::Operator.
 int32_t binary_op(Frame* f, uint32_t pc, uint32_t op) noexcept {
     JitCode* jc = f->chunk.jit.get();
+    jc->slow++;
     if (__builtin_expect(g_cfg.stats, 0)) { g_cfg.steps[f->chunk.code[pc]]++; g_cfg.step_total++; }
     f->instr_pc = pc;
     try {
@@ -857,6 +876,8 @@ struct StubSet {
     const void* entry[8] = {};
     bool tried = false;
 };
+// Per thread, not per process: the stubs embed the address of this thread's epoch
+// counters (thread-local in Object) so that a check is one load, not a TLS lookup.
 thread_local StubSet t_stubs;
 
 void write_barrier(Object* obj) noexcept;
@@ -874,6 +895,9 @@ void stub_unbox_object(Assembler& a, Label& miss) {
 }
 
 // rdx = the first entry of the block whose shape word equals rcx, or `miss`.
+// Unrolled rather than a loop: four compares against consecutive entries are
+// straight-line, predictable code, and the common site is monomorphic and
+// leaves after the first.
 void stub_find_way(Assembler& a, Label& miss) {
     static_assert(JitIC::kWays == 4, "unrolled for four ways");
     Label found;
@@ -1190,12 +1214,16 @@ private:
     void emit_bitwise(const Insn& in, size_t idx);
     void emit_compare(const Insn& in, size_t idx);
     void emit_incdec(const Insn& in, size_t idx, bool inc);
+    bool fusable_branch(size_t idx) const;
+    bool acc_dead_at(uint32_t pc) const;
+    bool fused_branch_ = false;      // set by emit_compare: the next instruction was folded into it
     void emit_truthiness(Label& when_true, Label& when_false, Label& slow);
     void emit_cond_jump(const Insn& in, size_t idx, bool jump_when_true, bool bool_known);
     void emit_get_named(const Insn& in, size_t idx, bool fused);
     void emit_set_named(const Insn& in, size_t idx);
     void emit_lookup(const Insn& in, size_t idx, bool fused);
     void emit_call(const Insn& in, uint32_t kind);
+    void emit_env_slot(const Insn& in, size_t idx, bool store, bool fused);
     // helper-backed slow paths (see "Fast helpers")
     void emit_fast_cold(const Insn& in, Label& slow, const void* fn, uint32_t kind, bool produces_acc, Label& resume, uint32_t ic = kNoOperand);
     void emit_fast_inline(const Insn& in, const void* fn, uint32_t kind, bool produces_acc, int fused_dst);
@@ -1248,7 +1276,9 @@ bool Compiler::decode() {
 
 void Compiler::emit_prologue() {
     // uint64_t entry(Frame* rdi, JitCode* rsi, const void* rdx)
-    a_.push(RBX); a_.push(R12); a_.push(R13); a_.push(R14); a_.push(R15);
+    a_.push(RBP); a_.push(RBX); a_.push(R12); a_.push(R13); a_.push(R14); a_.push(R15);
+    a_.sub_imm(RSP, 8);              // six pushes leave rsp 8 off a 16-byte boundary; every call out needs it aligned
+    a_.mov_imm64(RBP, kFiniteLimit);  // see finite_check
     a_.mov(RBX, RDI);
     a_.mov(R14, RSI);
     a_.mov_load(R12, mem(RBX, kOffRegs));
@@ -1297,18 +1327,20 @@ void Compiler::emit_shared_tails() {
     spill_acc();
     a_.mov_imm32(RAX, static_cast<uint32_t>(kExitFinished));
     a_.bind(epilogue_);
-    a_.pop(R15); a_.pop(R14); a_.pop(R13); a_.pop(R12); a_.pop(RBX);
+    a_.add_imm(RSP, 8);
+    a_.pop(R15); a_.pop(R14); a_.pop(R13); a_.pop(R12); a_.pop(RBX); a_.pop(RBP);
     a_.ret();
 }
 
 void Compiler::finite_check(Reg bits, Reg tmp, Label& slow) {
-    // A finite double has an exponent field other than 0x7FF; every tagged
-    // value (and NaN / infinity, which are tags too) has exactly 0x7FF.
-    a_.mov(tmp, bits);
-    a_.shr_imm(tmp, 52);
-    a_.and32_imm(tmp, 0x7FF);
-    a_.cmp32_imm(tmp, 0x7FF);
-    a_.jcc(CC_E, slow);
+    // A finite double has an exponent field other than 0x7FF; every tagged value
+    // (NaN and the infinities are tags too) has exactly 0x7FF. Doubling drops the
+    // sign, leaving the exponent in the top eleven bits, so "all ones" is a single
+    // unsigned compare against rbp (kFiniteLimit): three instructions and no
+    // immediate, where masking the exponent out took five.
+    a_.lea(tmp, mem_idx(bits, bits, 1));
+    a_.cmp(tmp, RBP);
+    a_.jcc(CC_AE, slow);
 }
 
 void Compiler::emit_step_call(const Insn& in, uint32_t target, uint32_t ic) {
@@ -1358,8 +1390,19 @@ void Compiler::branch(int cond, uint32_t from_pc, uint32_t target_pc) {
         if (cond < 0) a_.jmp(dest); else a_.jcc(static_cast<Cond>(cond), dest);
         return;
     }
+    if (cond < 0) {
+        // The common loop back edge: count down inline and fall into the safepoint
+        // only every sp_counter-th time, so the hot path is a subtract and one branch.
+        a_.sub32_mem_imm(mem(R14, offsetof(JitRt, sp_counter)), 1);
+        a_.jcc(CC_G, dest);
+        spill_acc();
+        a_.mov(RDI, RBX);
+        a_.call_abs(reinterpret_cast<const void*>(&safepoint));
+        a_.jmp(dest);
+        return;
+    }
     Label& back = new_label();
-    if (cond < 0) a_.jmp(back); else a_.jcc(static_cast<Cond>(cond), back);
+    a_.jcc(static_cast<Cond>(cond), back);
     cold_.push_back([this, &back, &dest]() {
         a_.bind(back);
         a_.sub32_mem_imm(mem(R14, offsetof(JitRt, sp_counter)), 1);
@@ -1435,8 +1478,11 @@ void Compiler::emit_compare(const Insn& in, size_t idx) {
     const bool eq_family = op == Op::TestEq || op == Op::TestNe || op == Op::TestStrictEq || op == Op::TestStrictNe;
     const bool negate = op == Op::TestNe || op == Op::TestStrictNe;
     const bool strict = op == Op::TestStrictEq || op == Op::TestStrictNe;
+    const bool fused = fusable_branch(idx);
     Label& slow = new_label();
-    Label& done = new_label();
+    // When the branch is fused in, the boolean never exists on the fast path; every
+    // slow path that does produce one resumes at the branch's own (cold) copy.
+    Label& done = fused ? *lbl_[idx + 1] : new_label();
     Label& non_numeric = eq_family ? new_label() : slow;
     a_.mov_load(RAX, reg_mem(r));
     finite_check(RAX, RCX, non_numeric);
@@ -1454,15 +1500,36 @@ void Compiler::emit_compare(const Insn& in, size_t idx) {
     case Op::TestNe: case Op::TestStrictNe: cc = CC_NE; break;
     default: break;
     }
-    a_.setcc(cc, RAX);
-    a_.movzx8(RAX, RAX);
-    a_.shl_imm(RAX, kTagShift);
-    a_.mov_imm64(RCX, kFalseBits);
-    a_.add(RAX, RCX);            // false + (1 << 48) is true
-    a_.mov(R13, RAX);
-    a_.bind(done);
-    emit_binary_cold(in, slow, binop_of(op));
-    acc_is_bool_ = true;
+    if (fused) {
+        const Insn& jump = insns_[idx + 1];
+        const bool jump_if_true = static_cast<Op>(jump.op) == Op::JumpIfTrue;
+        const uint32_t target = jump.pc + jump.len + i16(jump.pc + 1);
+        // Take the branch exactly when the comparison's truth equals what the jump wants.
+        static const Cond inverse[] = {CC_O, CC_NO, CC_AE, CC_B, CC_NE, CC_E, CC_A, CC_BE};
+        branch(jump_if_true ? cc : inverse[cc], jump.pc, target);
+        fused_branch_ = true;
+        // The branch instruction itself still has to exist for the slow paths and for
+        // anything that resumes at it, but it is no longer on the hot path.
+        cold_.push_back([this, idx]() {
+            a_.bind(*lbl_[idx + 1]);
+            const bool saved = acc_is_bool_;
+            acc_is_bool_ = true;
+            emit_insn(idx + 1);
+            acc_is_bool_ = saved;
+            if (idx + 2 < insns_.size()) a_.jmp(*lbl_[idx + 2]); else a_.jmp(exit_finished_);
+        });
+        emit_binary_cold(in, slow, binop_of(op));
+    } else {
+        a_.setcc(cc, RAX);
+        a_.movzx8(RAX, RAX);
+        a_.shl_imm(RAX, kTagShift);
+        a_.mov_imm64(RCX, kFalseBits);
+        a_.add(RAX, RCX);            // false + (1 << 48) is true
+        a_.mov(R13, RAX);
+        a_.bind(done);
+        emit_binary_cold(in, slow, binop_of(op));
+    }
+    acc_is_bool_ = !fused;
     if (eq_family) {
         // Operands that are not both numbers: the cases decided by the tags alone.
         cold_.push_back([this, &non_numeric, &slow, &done, strict, negate]() {
@@ -1520,9 +1587,7 @@ void Compiler::emit_incdec(const Insn& in, size_t idx, bool inc) {
     Label& slow = new_label();
     finite_check(R13, RCX, slow);
     a_.movq_to_xmm(XMM0, R13);
-    a_.mov_imm64(RAX, bits_of_double(inc ? 1.0 : -1.0));
-    a_.movq_to_xmm(XMM1, RAX);
-    a_.addsd(XMM0, XMM1);
+    a_.addsd_mem(XMM0, mem(R14, static_cast<int32_t>(inc ? offsetof(JitRt, one) : offsetof(JitRt, minus_one))));
     a_.movq_from_xmm(RAX, XMM0);
     finite_check(RAX, RCX, slow);
     a_.mov(R13, RAX);
@@ -1534,6 +1599,34 @@ void Compiler::emit_incdec(const Insn& in, size_t idx, bool inc) {
 // `when_false`; a string, BigInt, symbol, NaN or infinity goes to `slow`.
 // Booleans, undefined, null, objects, functions and finite numbers are all it
 // takes to cover nearly every condition a program tests.
+// Whether the accumulator's value is certainly overwritten before anything reads
+// it, starting at the instruction at `pc`: the loads that ignore it.
+bool Compiler::acc_dead_at(uint32_t pc) const {
+    if (pc >= code_size_ || insn_at_[pc] < 0) return false;
+    switch (static_cast<Op>(chunk_.code[pc])) {
+    case Op::Ldar: case Op::LdarStar: case Op::LdaZero: case Op::LdaZeroStar: case Op::LdaSmi: case Op::LdaSmiStar:
+    case Op::LdaConst: case Op::LdaConstStar: case Op::LdaUndefined: case Op::LdaNull: case Op::LdaTrue: case Op::LdaFalse:
+    case Op::LdaThis: case Op::LdaThisStar: case Op::LdaLookup: case Op::LdaLookupStar:
+    case Op::LdaEnvSlot: case Op::LdaEnvSlotStar: case Op::GetNamed: case Op::GetNamedStar:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A comparison straight followed by a conditional jump that nothing else lands
+// on, where neither way out reads the boolean: the jump can use the flags the
+// comparison left, and the boolean is never built. A loop condition is exactly
+// this, and it is most of what a tight numeric loop executes besides the work.
+bool Compiler::fusable_branch(size_t idx) const {
+    if (idx + 2 >= insns_.size()) return false;
+    const Insn& jump = insns_[idx + 1];
+    const Op op = static_cast<Op>(jump.op);
+    if ((op != Op::JumpIfTrue && op != Op::JumpIfFalse) || is_target_[jump.pc]) return false;
+    const uint32_t target = jump.pc + jump.len + i16(jump.pc + 1);
+    return acc_dead_at(insns_[idx + 2].pc) && acc_dead_at(target);
+}
+
 void Compiler::emit_truthiness(Label& when_true, Label& when_false, Label& slow) {
     a_.mov(RAX, R13);
     a_.shr_imm(RAX, 48);
@@ -1751,6 +1844,48 @@ void Compiler::emit_binary_cold(const Insn& in, Label& slow, uint32_t binop) {
     });
 }
 
+// LdaEnvSlot / StaEnvSlot for a slot in the environment's inline entries (the
+// first six bindings of a scope, which is nearly all of them). The environment is
+// found the way frame_lexical_env() finds it: a frame that shares its caller's
+// Context keeps its own in the Frame, any other uses the Context's. A store inlines
+// only for a number, which needs no write barrier; the helper does the rest.
+void Compiler::emit_env_slot(const Insn& in, size_t idx, bool store, bool fused) {
+    const uint32_t slot = chunk_.code[in.pc + 1];
+    const std::string* key = chunk_.names[u16(in.pc + 2)];
+    Label& slow = new_label();
+    Label& done = new_label();
+    Label& have = new_label();
+    Label& via_ctx = new_label();
+    if (store) finite_check(R13, RCX, slow);
+    a_.cmp_mem_imm(mem(RBX, kOffCallInfo), 0);
+    a_.jcc(CC_E, via_ctx);
+    a_.mov_load(RAX, mem(RBX, kOffCurLexEnv));
+    a_.jmp(have);
+    a_.bind(via_ctx);
+    a_.mov_load(RAX, mem(RBX, kOffCtx));
+    a_.mov_load(RAX, mem(RAX, static_cast<int32_t>(JitEnvLayout::ctx_lexical_environment())));
+    a_.bind(have);
+    a_.test(RAX, RAX);
+    a_.jcc(CC_E, slow);
+    // The compiler predicted this slot; the key says whether the prediction holds here.
+    a_.mov_imm64(RCX, reinterpret_cast<uint64_t>(key));
+    a_.cmp_load(RCX, mem(RAX, static_cast<int32_t>(JitEnvLayout::entry(slot) + JitEnvLayout::key())));
+    a_.jcc(CC_NE, slow);
+    a_.cmp8_mem_imm(mem(RAX, static_cast<int32_t>(JitEnvLayout::entry(slot) + JitEnvLayout::initialized())), 0);
+    a_.jcc(CC_E, slow);
+    if (store) {
+        a_.cmp8_mem_imm(mem(RAX, static_cast<int32_t>(JitEnvLayout::entry(slot) + JitEnvLayout::mutable_flag())), 0);
+        a_.jcc(CC_E, slow);
+        a_.mov_store(mem(RAX, static_cast<int32_t>(JitEnvLayout::entry(slot) + JitEnvLayout::value())), R13);
+    } else {
+        a_.mov_load(R13, mem(RAX, static_cast<int32_t>(JitEnvLayout::entry(slot) + JitEnvLayout::value())));
+    }
+    a_.bind(done);
+    if (fused) a_.mov_store(reg_mem(chunk_.code[in.pc + 4]), R13);
+    emit_fast_cold(in, slow, reinterpret_cast<const void*>(&fast_env_slot), store ? 1 : 0, !store, done);
+    (void)idx;
+}
+
 void Compiler::emit_this(const Insn& in, size_t idx, bool fused) {
     Label& slow = new_label();
     a_.cmp8_mem_imm(mem(RBX, kOffThisResolved), 0);
@@ -1966,12 +2101,14 @@ void Compiler::emit_insn(size_t idx) {
     }
     case Op::LdaEnvSlot: case Op::LdaEnvSlotStar: {
         if (u16(in.pc + 2) >= chunk_.names.size() || (op == Op::LdaEnvSlotStar && !reg_ok(code[in.pc + 4]))) { fail("operand"); return; }
-        emit_fast_inline(in, reinterpret_cast<const void*>(&fast_env_slot), 0, true, op == Op::LdaEnvSlotStar ? code[in.pc + 4] : -1);
+        if (code[in.pc + 1] < JitEnvLayout::kInlineSlots) emit_env_slot(in, idx, false, op == Op::LdaEnvSlotStar);
+        else emit_fast_inline(in, reinterpret_cast<const void*>(&fast_env_slot), 0, true, op == Op::LdaEnvSlotStar ? code[in.pc + 4] : -1);
         break;
     }
     case Op::StaEnvSlot:
         if (u16(in.pc + 2) >= chunk_.names.size()) { fail("operand"); return; }
-        emit_fast_inline(in, reinterpret_cast<const void*>(&fast_env_slot), 1, false, -1);
+        if (code[in.pc + 1] < JitEnvLayout::kInlineSlots) emit_env_slot(in, idx, true, false);
+        else emit_fast_inline(in, reinterpret_cast<const void*>(&fast_env_slot), 1, false, -1);
         break;
     case Op::LdaEnvSlotAt:
         if (u16(in.pc + 3) >= chunk_.names.size()) { fail("operand"); return; }
@@ -2056,8 +2193,10 @@ std::unique_ptr<JitCode, JitCodeDeleter> Compiler::compile(const char*& why) {
     emit_prologue();
     for (size_t i = 0; i < insns_.size(); i++) {
         a_.bind(*lbl_[i]);
+        fused_branch_ = false;
         emit_insn(i);
         if (fail_) { why = fail_; return nullptr; }
+        if (fused_branch_) i++;   // its jump was folded in and lives on the cold side
     }
     // Falling off the end cannot happen in well-formed bytecode; if it does,
     // finish with whatever the accumulator holds rather than run into the
@@ -2177,6 +2316,21 @@ bool chunk_has_loop(const BytecodeChunk& chunk) noexcept {
 // The interpreter's offer at a hot back edge (see osr_try in Interpreter.cpp).
 bool osr(Frame& f, uint32_t target, const Value& acc) noexcept;
 
+// Every 1024 entries: has this function earned its keep? A baseline JIT saves
+// dispatch, and each stub miss or step costs more than the dispatch it saved, so
+// a function that leaves its fast paths more than `max_slow_per_entry` times per
+// call (megamorphic property sites are the usual cause) is faster in the
+// interpreter. The code stays allocated -- frames may be running it -- and only
+// stops being entered.
+bool tally(JitCode* jc) noexcept {
+    const uint64_t slow = jc->slow;
+    if (g_cfg.log) std::fprintf(stderr, "[jit] tally entries=%u slow=%llu code=%zu\n", jc->entries,
+                                static_cast<unsigned long long>(slow), jc->code_bytes);
+    jc->slow = 0;
+    if (slow > static_cast<uint64_t>(g_cfg.max_slow_per_entry) * 1024) jc->disabled = true;
+    return jc->disabled;
+}
+
 // The slow half of run(): everything but "started at pc 0 and finished".
 [[gnu::noinline]] Value run_resume(Frame& f, JitCode* jc, uint64_t status) {
     if (status == kExitRethrow) {
@@ -2199,6 +2353,8 @@ bool osr(Frame& f, uint32_t target, const Value& acc) noexcept;
 // Runs the frame in generated code from f.pc until it finishes or has to hand
 // the rest to the interpreter.
 [[gnu::always_inline]] inline Value run(Frame& f, JitCode* jc) {
+    if (__builtin_expect(jc->disabled, 0)) return run_dispatch(f);
+    if (__builtin_expect(((++jc->entries) & 1023) == 0, 0) && tally(jc)) return run_dispatch(f);
     if (__builtin_expect(f.pc == 0 && jc->owner_thread == &g_thread_marker, 1)) {
         const uint64_t status = jc->entry(&f, jc, jc->rt.base + jc->start_off);
         if (__builtin_expect(status == kExitFinished, 1)) return f.acc;
@@ -2209,7 +2365,8 @@ bool osr(Frame& f, uint32_t target, const Value& acc) noexcept;
 }
 
 bool osr(Frame& f, uint32_t target, const Value& acc) noexcept {
-    f.osr_budget = INT32_MAX;                       // one offer per activation unless it is taken up
+    // One offer per activation unless it is taken: if compiling is refused, asking again
+    // at every back edge would cost more than the loop saves.
     const BytecodeChunk& chunk = f.chunk;
     if (chunk.jit_state == 2) return false;
     if (chunk.jit_state != 1) {

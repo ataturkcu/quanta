@@ -66,6 +66,8 @@ struct JitRt {
     // that every site would otherwise carry its own copy of. Generated code
     // calls them through this table.
     const void* stubs[8] = {};
+    double one = 1.0;                  // Inc/Dec add +-one from memory instead of building it in a register
+    double minus_one = -1.0;
 };
 static_assert(sizeof(JitIC) == 64, "generated code scales an IC index by 64");
 
@@ -87,6 +89,12 @@ struct JitCode {
     std::exception_ptr pending;
     const void* owner_thread = nullptr;
     uint32_t code_size = 0;
+    // Self-profile: how often generated code left its fast paths (a stub miss or a
+    // step) against how often it was entered. A function that keeps missing is
+    // faster interpreted, and is switched off (see jit::tally).
+    uint32_t entries = 0;
+    uint32_t slow = 0;
+    bool disabled = false;
     uint32_t start_off = 0;        // native offset of the instruction at pc 0
     bool has_handlers = false;     // the chunk has try regions: a step must stop at their landing pads
 };
@@ -127,6 +135,17 @@ struct JitObjectLayout {
 };
 
 struct JitEnvLayout {
+    using Entry = Environment::SlotMap::InlineEntry;
+    static constexpr uint32_t kInlineSlots = static_cast<uint32_t>(Environment::SlotMap::kInlineCapacity);
+    static size_t ctx_lexical_environment() { return offsetof(Context, lexical_environment_); }
+    // Byte offsets, from the Environment, of inline slot `index`'s key, value and flags.
+    static size_t entry(uint32_t index) {
+        return offsetof(Environment, slots_) + offsetof(Environment::SlotMap, inline_entries) + index * sizeof(Entry);
+    }
+    static size_t key() { return offsetof(Entry, key); }
+    static size_t value() { return offsetof(Entry, slot) + offsetof(Environment::BindingSlot, value); }
+    static size_t initialized() { return offsetof(Entry, slot) + offsetof(Environment::BindingSlot, initialized); }
+    static size_t mutable_flag() { return offsetof(Entry, slot) + offsetof(Environment::BindingSlot, mutable_flag); }
     static size_t binding_object() { return offsetof(Environment, binding_object_); }
     static const uint32_t* shadow_epoch_addr() { return &Environment::s_binding_shadow_epoch; }
 };
