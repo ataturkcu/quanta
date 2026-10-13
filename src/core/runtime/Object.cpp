@@ -315,16 +315,6 @@ bool Object::try_read_own_data_slot(const std::string& key, Value& out) const {
     return true;
 }
 
-void Object::add_shape_property_cached(const std::string& key, const Value& value, Shape* to_shape) {
-    shape_ = to_shape;
-    uint32_t new_count = to_shape->slot_count();
-    ensure_shape_capacity(new_count);
-    *shape_slot_ptr(new_count - 1) = value;
-    // Mirrors store_in_overflow's own bump for the equivalent slow-path
-    // branch -- this object may itself be used as another chain's prototype.
-    if (used_as_prototype()) bump_proto_epoch();
-}
-
 void Object::add_accessor_shape_property_cached(const std::string& key, const Value& getter,
                                                  const Value& setter, Shape* to_shape) {
     shape_ = to_shape;

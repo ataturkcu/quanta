@@ -904,7 +904,17 @@ public:
     // hash lookup and the prototype-chain walk. Caller guarantees every
     // precondition store_in_overflow's "new property" branch would have
     // checked (Ordinary, extensible, no descriptor override, shape lacks key).
-    void add_shape_property_cached(const std::string& key, const Value& value, Shape* to_shape);
+    // Inline because the store handlers call it for every property a constructor
+    // or a literal adds, and the work is a shape swap and one slot write; the
+    // butterfly only grows (out of line) when the slot is not already there.
+    void add_shape_property_cached(const std::string&, const Value& value, Shape* to_shape) {
+        shape_ = to_shape;
+        const uint32_t new_count = to_shape->slot_count();
+        if (new_count > shape_capacity()) ensure_shape_capacity(new_count);
+        *shape_slot_ptr(new_count - 1) = value;
+        // This object may itself be used as another chain's prototype.
+        if (used_as_prototype()) bump_proto_epoch();
+    }
 
     // Accessor sibling of add_shape_property_cached: `to_shape` must come
     // from Shape::transition_accessor(key), reserving two consecutive

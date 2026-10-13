@@ -9209,9 +9209,17 @@ template <bool Fast>
         const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
         const Value* this_val, Function* owner, const Value* initial_acc,
         const CallInfo* call_info, Value* regs, Environment** final_lexical_env) {
-    const uint8_t param_count = chunk.parameter_count;
-    for (uint8_t i = 0; i < param_count && i < args.size(); i++) {
+    // Almost always one to three arguments: a plain loop. Left to itself the
+    // vectorizer builds a four-wide body with a run-up test and a scalar tail,
+    // a dozen instructions of setup for a copy that rarely reaches the second
+    // vector.
+    const size_t arg_copy = std::min<size_t>(chunk.parameter_count, args.size());
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    for (size_t i = 0; i < arg_copy; i++) {
         regs[i] = args[i];
+        // Keeps the loop from being turned into a memcpy call, which costs more
+        // for these lengths than the copy itself.
+        __asm__ volatile("" ::: "memory");
     }
 
     // Side-stack for Op::SaveEnv/RestoreEnv/PopEnvSave. Not a GC root:
