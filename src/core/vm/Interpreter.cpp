@@ -7118,6 +7118,18 @@ Value h_GetNamedRest(Frame& f, uint32_t pc, Value acc) {
             FUSED_TAIL(6);
         }
     }
+    // `F.prototype`, read off a function: the field itself, where the general path checks the
+    // key against "arguments", "caller", "name" and "length" first and then walks the
+    // descriptors -- the commonest read a function receiver gets (`new` setups, class
+    // factories, every `instanceof` written by hand).
+    if (receiver.is_function()) {
+        static const std::string* const kPrototype = Shape::intern("prototype");
+        Function* fn = receiver.as_function();
+        if (&f.chunk.name_at(read_u16(code, pc + 2)) == kPrototype && fn->has_plain_prototype()) {
+            acc = fn->constructor_prototype();
+            FUSED_TAIL(6);
+        }
+    }
     if (LIKELY(receiver.is_object())) {
         Object* obj = receiver.as_object();
         if (obj->get_type() == Object::ObjectType::Array) {

@@ -2002,6 +2002,9 @@ public:
     // GetPrototypeFromConstructor's read. get_property("prototype") answers
     // from prototype_ when it is set, but only after comparing the key against
     // "name" and "length" on the way in.
+    // Whether `.prototype` is simply the field (built, or built on first demand), so that a read
+    // of it can skip get_property's name checks and the descriptor walk.
+    bool has_plain_prototype() const { return prototype_ || prototype_pending_; }
     Value constructor_prototype() const {
         if (prototype_ || prototype_pending_) return Value(ensure_prototype());
         return get_property("prototype");
