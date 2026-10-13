@@ -2904,6 +2904,30 @@ static void test_frame_files_and_module_promises() {
         CHECK(Embed::ToWtf8(cr, Embed::Get(cr, Value(cr.get_global_object()), "rest")) == "5,3|2|7,8|2|1");
     }
 
+    // A class in a function does not make that function's block-scoped names
+    // environment-resident -- only what the class itself reads stays there. Each case
+    // has the class read a loop or block binding in a different position, since a
+    // register standing in for one of those would be shared across iterations.
+    {
+        std::unique_ptr<Embed::Realm> rr = isolate->CreateRealm();
+        CHECK(rr->Evaluate(
+            "function m() { const fs = []; for (let i = 0; i < 3; i++) { class A { m() { return i; } } fs.push(new A()); } return fs.map(o => o.m()).join(); }"
+            "function f() { const os = []; for (let i = 0; i < 3; i++) { class A { v = i * 10; } os.push(new A()); } return os.map(o => o.v).join(); }"
+            "function k() { const r = []; for (let i = 0; i < 2; i++) { class A { [`k${i}`]() {} } r.push(Object.getOwnPropertyNames(A.prototype).join('')); } return r.join(); }"
+            "function e() { const r = []; for (let i = 0; i < 3; i++) { const base = class { b() { return i; } }; class A extends base {} r.push(new A().b()); } return r.join(); }"
+            "function s() { const r = []; for (let i = 0; i < 3; i++) { class A { static v; static { A.v = i + 100; } } r.push(A.v); } return r.join(); }"
+            "function u(n) { let t = 0; for (let i = 0; i < n; i++) { const sq = i * i; class A { static id = 7; } t += sq + A.id; } return t; }"
+            "function d() { let x = 1; class A { m() { let x = 2; return x; } g() { return x; } } { let x = 3; return [new A().m(), new A().g(), x].join(); } }"
+            "function z() { class A { m() { return late; } } let msg; try { new A().m(); } catch (err) { msg = err.constructor.name; } let late = 5; return msg + ',' + new A().m(); }"
+            "function w() { const r = []; for (const q in { a: 1, b: 2 }) { class A { get() { return q; } } r.push(new A().get()); } for (const v of [7, 8]) { class B { get() { return v; } } r.push(new B().get()); } return r.join(); }"
+            "function y() { const fs = []; for (let i = 0; i < 3; i++) { class A { m() { return () => i; } } fs.push(new A().m()); } return fs.map(g => g()).join(); }"
+            "function* gen() { for (let i = 0; i < 3; i++) { class A { m() { return i; } } yield new A().m(); } }"
+            "globalThis.caps = [m(), f(), k(), e(), s(), u(5), d(), z(), w(), y(), [...gen()].join()].join('|');").ok);
+        Context& cr = rr->GetContext();
+        CHECK(Embed::ToWtf8(cr, Embed::Get(cr, Value(cr.get_global_object()), "caps")) ==
+              "0,1,2|0,10,20|constructork0,constructork1|0,1,2|100,101,102|65|2,1,3|ReferenceError,5|a,b,7,8|0,1,2|0,1,2");
+    }
+
     // A strict script is strict for itself, not for the scripts that run after it in the realm.
     {
         std::unique_ptr<Embed::Realm> s = isolate->CreateRealm();

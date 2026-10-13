@@ -2935,8 +2935,33 @@ bool references_outside(const ASTNode* node, const std::unordered_set<const ASTN
             const auto* n = static_cast<const AsyncFunctionExpression*>(node);
             return walk_params(n->get_params()) || references_outside(n->get_body(), regions, name);
         }
-        case ASTNode::Type::CLASS_DECLARATION:
-            return true;  // opaque to this scan, same conservative treatment as collect_closure_names
+        // A class declaration is read the way collect_closure_names reads it: its
+        // heritage, computed keys, methods, fields and static blocks all run in
+        // the scope around it, so a mention of `name` anywhere in them is a
+        // mention from outside the region. Answering "yes" for every class
+        // instead made one class anywhere in a function push every block-scoped
+        // `let`/`const` and every loop counter of that function into the heap
+        // Environment, with a fresh scope allocated per iteration.
+        // The expression form is still handed over whole (see
+        // named_evaluation_needs_delegate), so it keeps the conservative answer.
+        case ASTNode::Type::CLASS_DECLARATION: {
+            const auto* n = static_cast<const ClassDeclaration*>(node);
+            if (n->is_expression()) return true;
+            return references_outside(n->get_superclass(), regions, name) ||
+                   references_outside(n->get_body(), regions, name);
+        }
+        case ASTNode::Type::METHOD_DEFINITION: {
+            const auto* n = static_cast<const MethodDefinition*>(node);
+            return (n->is_computed() && references_outside(n->get_key(), regions, name)) ||
+                   references_outside(n->get_value(), regions, name);
+        }
+        case ASTNode::Type::CLASS_FIELD: {
+            const auto* n = static_cast<const ClassField*>(node);
+            return (n->is_computed() && references_outside(n->get_key(), regions, name)) ||
+                   references_outside(n->get_value(), regions, name);
+        }
+        case ASTNode::Type::CLASS_STATIC_BLOCK:
+            return references_outside(static_cast<const ClassStaticBlock*>(node)->get_body(), regions, name);
         case ASTNode::Type::BLOCK_STATEMENT: {
             const auto* n = static_cast<const BlockStatement*>(node);
             for (const auto& stmt : n->get_statements())
