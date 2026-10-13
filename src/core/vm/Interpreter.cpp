@@ -9256,6 +9256,12 @@ Value run_suspendable_chunk(const BytecodeChunk& chunk, Context& ctx, Function* 
 
 void jit_free_code(JitCode* code) noexcept { VM::jit::free_code(code); }
 
+void jit_forget_cells(JitCode* code) noexcept {
+    // Only ever called with no generated code running (a realm or isolate is
+    // being torn down on this thread), so resetting entries in place is safe.
+    for (JitIC& ic : code->ics) ic = JitIC{};
+}
+
 void jit_trace(const JitCode* code, Visitor& v) {
     for (const JitIC& ic : code->ics) {
         if (ic.kind == JitIC::Empty || ic.kind == JitIC::Own) continue;

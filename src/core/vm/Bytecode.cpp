@@ -37,6 +37,12 @@ std::vector<ClosureTemplate>& BytecodeChunk::ensure_closures() {
 const FeedbackBody FeedbackSlot::kEmpty;
 
 void BytecodeChunk::drop_feedback() const {
+    // The baseline JIT's caches hold cells of their own (a prototype, a holder, a
+    // cached value) and are keyed by their addresses. They outlive the realm that
+    // learned them exactly as the interpreter's feedback does, and a realm created
+    // later can be handed the same addresses: a stale entry would then hit and
+    // return the old realm's object. Forgetting them is what keeps the two in step.
+    if (jit) jit_forget_cells(jit.get());
     for (const auto& slot : feedback) const_cast<FeedbackSlot&>(slot).body.reset();
     if (ic_feedback) {
         for (auto& kfb : ic_feedback->keyed_feedback) kfb.reset();
