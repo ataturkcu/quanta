@@ -30,6 +30,13 @@ struct JitCode;
 void jit_free_code(JitCode* code) noexcept;
 // Empties the inline caches the generated code keeps (see BytecodeChunk::drop_feedback).
 void jit_forget_cells(JitCode* code) noexcept;
+
+struct BytecodeChunk;
+namespace VM {
+// Whether the chunk is a bare `return <constant | this | this.name>` (see try_leaf_call
+// in Interpreter.h). Looks at the bytes the first time and remembers the answer.
+bool leaf_candidate(const BytecodeChunk& chunk);
+}
 struct JitCodeDeleter {
     void operator()(JitCode* p) const noexcept { jit_free_code(p); }
 };
@@ -939,6 +946,16 @@ struct BytecodeChunk {
     mutable std::unique_ptr<JitCode, JitCodeDeleter> jit;
     mutable uint16_t jit_hotness = 0;
     mutable uint8_t jit_state = 0;
+
+    // A function whose whole body is `return <constant>`, `return this` or
+    // `return this.name` is answered without a frame (VM::try_leaf_call). What the
+    // body is, found on the first call: 0 not looked at yet, otherwise a LeafKind
+    // (Interpreter.cpp). The name and feedback indices are `this.name`'s;
+    // leaf_bits is the constant, as the bits of a Value.
+    mutable uint8_t leaf_kind = 0;
+    mutable uint16_t leaf_name = 0;
+    mutable uint16_t leaf_feedback = 0;
+    mutable uint64_t leaf_bits = 0;
 
     // env_mode: every local lives in ctx.get_lexical_environment() instead of
     // a register. env_params/env_locals seed function entry, via VM::run.

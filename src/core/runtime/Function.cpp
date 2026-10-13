@@ -725,6 +725,13 @@ Value Function::call_gated(Context& ctx, std::span<const Value> args, Value this
     return vm_result;
 }
 
+// Out of line, so that the check in call_fast_gate costs a function that is not a leaf
+// one byte test and no extra saved registers: this call is what gave the prologue more to
+// save, about ten instructions on every call of the benchmarks that have no leaf calls.
+[[gnu::noinline]] static bool answer_leaf_call(const FunctionExecutable& exe, const Value& this_value, Value& out) {
+    return VM::try_leaf_call(*exe.bytecode_chunk, this_value, out);
+}
+
 // Straight from a call handler for a callee whose gate is open: fast_callable()
 // has said it is a plain compiled function with the register-mode gate, and what
 // is left of the general entry's prologue is done here -- consuming a pending
@@ -737,6 +744,14 @@ Value Function::call_fast_gate(Context& ctx, std::span<const Value> args, Value 
         return call_default_impl(ctx, args, this_value, nullptr);
     }
     ctx.consume_pending_construct_call();
+    // A body that only returns a constant, `this` or one of its data properties needs
+    // neither a frame nor a call-stack entry: nothing in it can throw, call or be
+    // observed (see VM::try_leaf_call for exactly what it takes). Not for an arrow,
+    // whose `this` is the enclosing one and not the receiver passed here.
+    if (UNLIKELY_NATIVE(executable_->fast_leaf) && !is_arrow_) {
+        Value result;
+        if (answer_leaf_call(*executable_, this_value, result)) return result;
+    }
     CallStack& stack = CallStack::instance();
     if (stack.depth() >= CallStack::MAX_STACK_DEPTH) {
         ctx.throw_range_error("Maximum call stack size exceeded");

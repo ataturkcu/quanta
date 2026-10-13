@@ -68,6 +68,15 @@ private:
     bool linked_ = false;
 };
 
+// Answers a call to a function that does nothing but return a constant, `this` or one
+// of this's data properties, without building a frame -- a getter-style accessor, an
+// `isFoo() { return false; }` stub, a method that returns its receiver: the commonest
+// small functions there are, and a call to one cost about five hundred instructions to
+// do a load. Returns true and sets `out` only when the answer is exactly what running
+// the body would give; false (for anything else, including every case in which the
+// body could throw, call something or see a coerced `this`) means: make the call.
+bool try_leaf_call(const BytecodeChunk& chunk, const Value& this_value, Value& out);
+
 // Prints the baseline JIT's counters (QUANTA_JIT_STATS=1 / QUANTA_JIT_LOG=1); a no-op otherwise.
 void jit_print_stats();
 

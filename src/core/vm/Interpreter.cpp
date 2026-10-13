@@ -9483,4 +9483,93 @@ void jit_trace(const JitCode* code, Visitor& v) {
 
 namespace Quanta::VM {
 void jit_print_stats() { jit::print_stats(); }
+
+namespace {
+
+enum LeafKind : uint8_t { kLeafUnknown = 0, kLeafNone, kLeafConstant, kLeafThis, kLeafThisProperty };
+
+// Looks at the chunk's bytes once and files what the function is. Anything but the
+// four shapes below -- and any chunk with a try region, which the shapes cannot
+// have -- is "none" for good.
+void analyze_leaf(const BytecodeChunk& chunk) {
+    chunk.leaf_kind = kLeafNone;
+    if (chunk.handlers && !chunk.handlers->empty()) return;
+    const uint8_t* c = chunk.code.data();
+    const size_t n = chunk.code.size();
+    if (n < 2 || n > 16) return;
+    const auto op_at = [&](size_t pc) { return pc < n ? static_cast<Op>(c[pc]) : Op::kCount; };
+    uint64_t bits;
+    switch (op_at(0)) {
+        case Op::LdaUndefined: bits = std::bit_cast<uint64_t>(Value()); break;
+        case Op::LdaNull: bits = std::bit_cast<uint64_t>(Value::null()); break;
+        case Op::LdaTrue: bits = std::bit_cast<uint64_t>(Value(true)); break;
+        case Op::LdaFalse: bits = std::bit_cast<uint64_t>(Value(false)); break;
+        case Op::LdaZero: bits = std::bit_cast<uint64_t>(Value(0.0)); break;
+        case Op::LdaSmi: bits = std::bit_cast<uint64_t>(Value(static_cast<double>(static_cast<int8_t>(c[1])))); break;
+        case Op::LdaThis:
+            if (op_at(1) == Op::Return) chunk.leaf_kind = kLeafThis;
+            return;
+        case Op::LdaThisStar: {
+            // LdaThisStar r; GetNamed r name feedback; Return
+            const uint8_t reg = c[1];
+            if (op_at(2) == Op::GetNamed && c[3] == reg && op_at(8) == Op::Return) {
+                chunk.leaf_name = read_u16(c, 4);
+                chunk.leaf_feedback = read_u16(c, 6);
+                chunk.leaf_kind = kLeafThisProperty;
+            }
+            return;
+        }
+        default: return;
+    }
+    if (op_at(1 + static_cast<size_t>(op_operand_bytes(op_at(0)))) == Op::Return) {
+        chunk.leaf_bits = bits;
+        chunk.leaf_kind = kLeafConstant;
+    }
+}
+
+}  // namespace
+
+bool leaf_candidate(const BytecodeChunk& chunk) {
+    if (chunk.leaf_kind == kLeafUnknown) analyze_leaf(chunk);
+    return chunk.leaf_kind != kLeafNone;
+}
+
+bool try_leaf_call(const BytecodeChunk& chunk, const Value& this_value, Value& out) {
+    uint8_t kind = chunk.leaf_kind;
+    if (kind == kLeafUnknown) { analyze_leaf(chunk); kind = chunk.leaf_kind; }
+    switch (kind) {
+    case kLeafConstant:
+        out = std::bit_cast<Value>(chunk.leaf_bits);
+        return true;
+    case kLeafThis:
+        // Only a receiver that is already an object: a sloppy function would hand
+        // back undefined as the global object and a primitive boxed.
+        if (!this_value.is_object() && !this_value.is_function()) return false;
+        out = this_value;
+        return true;
+    case kLeafThisProperty: {
+        // The read the body's GetNamed would do on its first, cheapest tier -- the
+        // site's learned entries -- and nothing past that: a site that has not
+        // learned this receiver, an accessor or an override simply makes the call,
+        // which then learns it. Nothing here can throw or run script.
+        if (!this_value.is_object()) return false;
+        Object* obj = this_value.as_object();
+        if (!shape_fast_path_ok(obj->get_type())) return false;
+        const FeedbackBody& fb = chunk.feedback[chunk.leaf_feedback].read();
+        Shape* shape = obj->get_shape();
+        for (uint8_t k = 0; k < fb.count; k++) {
+            const FeedbackSlot::Entry& e = fb.entries[k];
+            if (e.shape != shape) continue;
+            if (!e.shape || e.is_accessor || obj->has_any_descriptor_override()) return false;
+            const Value* slot = obj->get_shape_slot_unchecked(e.slot_index);
+            if (!slot) return false;
+            out = *slot;
+            return true;
+        }
+        return inherited_data_entry(fb, obj, out);
+    }
+    default:
+        return false;
+    }
+}
 }
