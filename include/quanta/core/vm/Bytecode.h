@@ -28,6 +28,8 @@ struct JitCode;
 // Frees a chunk's baseline-JIT code (Jit.inc). Out of line so this header
 // does not need the JIT's definitions.
 void jit_free_code(JitCode* code) noexcept;
+// Empties the inline caches the generated code keeps (see BytecodeChunk::drop_feedback).
+void jit_forget_cells(JitCode* code) noexcept;
 struct JitCodeDeleter {
     void operator()(JitCode* p) const noexcept { jit_free_code(p); }
 };
