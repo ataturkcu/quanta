@@ -109,6 +109,8 @@ struct Config {
     bool trace = false;
     bool debug = false;           // stats || trace: the one flag the hot helpers test
     int32_t safepoint_reload = 64;
+    uint32_t max_chunk_bytes = 16384;  // larger bytecode is not attempted at all
+    uint32_t max_step_percent = 10;   // refuse a chunk that is more than this share plain steps
     uint32_t mode = 1;             // 1: functions with loops only (default), 0: any hot function
     uint32_t max_slow_per_entry = 10;
     uint32_t threshold = 6;        // calls before a loop-free function is compiled
@@ -232,6 +234,8 @@ void init_once() {
     if (const char* t = std::getenv("QUANTA_JIT_MAXSLOW")) g_cfg.max_slow_per_entry = static_cast<uint32_t>(std::atoi(t));
     if (const char* t = std::getenv("QUANTA_JIT_THRESHOLD")) g_cfg.threshold = static_cast<uint32_t>(std::atoi(t));
     if (const char* d = std::getenv("QUANTA_JIT_DUMP")) g_cfg.dump_dir = d;
+    if (const char* m = std::getenv("QUANTA_JIT_MAXBYTES")) g_cfg.max_chunk_bytes = static_cast<uint32_t>(std::atoi(m));
+    if (const char* m = std::getenv("QUANTA_JIT_MAXSTEPS")) g_cfg.max_step_percent = static_cast<uint32_t>(std::atoi(m));
     if (const char* m = std::getenv("QUANTA_JIT_LIMIT")) g_cfg.limit = static_cast<uint32_t>(std::atoi(m));
     if (const char* m = std::getenv("QUANTA_JIT_SKIP")) g_cfg.skip = static_cast<uint32_t>(std::atoi(m));
     g_cfg.debug = g_cfg.stats || g_cfg.trace;
@@ -1178,6 +1182,7 @@ private:
     Label step_other_, exit_finished_, exit_rethrow_, exit_bail_, exit_bail_pc_, epilogue_;
     uint32_t code_size_ = 0;
     const char* fail_ = nullptr;
+    uint32_t full_steps_ = 0;   // instructions that are nothing but a step into the interpreter
 
     // Whether acc is known to hold a boolean at the start of the instruction
     // being emitted (the previous instruction left it, and nothing can jump
@@ -1355,6 +1360,7 @@ void Compiler::emit_step_call(const Insn& in, uint32_t target, uint32_t ic) {
 }
 
 void Compiler::emit_step(const Insn& in, uint32_t target, uint32_t ic) {
+    full_steps_++;
     emit_step_call(in, target, ic);
     const uint32_t next = in.pc + in.len;
     if (next < code_size_) {
@@ -2214,7 +2220,21 @@ std::unique_ptr<JitCode, JitCodeDeleter> Compiler::compile(const char*& why) {
         if (pos <= 0) { why = "unbound instruction"; return nullptr; }
         jc->native_off[insns_[i].pc] = static_cast<uint32_t>(pos);
     }
+    // A baseline JIT removes dispatch and nothing else, so it only pays for code
+    // whose instructions it can do itself. Every instruction left as a bare step
+    // still goes through the interpreter and adds the cost of getting there, which
+    // is why a chunk that is mostly steps ran slower compiled and held several
+    // times its size in code (a real-world bundle compiled dozens of them and grew
+    // by 27 MB while running 5-8% slower). The winners measured -- Crypto and
+    // NavierStokes, 2x -- are at or under 3% steps; this refuses what is well past
+    // that before any memory is mapped for it.
+    if (insns_.size() >= 8 && static_cast<uint64_t>(full_steps_) * 100 > static_cast<uint64_t>(g_cfg.max_step_percent) * insns_.size()) {
+        why = "mostly steps";
+        return nullptr;
+    }
     jc->code_bytes = a_.size();
+    if (g_cfg.log) std::fprintf(stderr, "[jit] shape insns=%zu steps=%u bytes=%zu env_mode=%d\n", insns_.size(), full_steps_,
+                                a_.size(), chunk_.env_mode ? 1 : 0);
     uint8_t* start = nullptr;
     if (!alloc_exec(a_.buf, jc->mem, jc->mem_size, start)) { why = "out of executable memory"; return nullptr; }
     jc->rt.sp_counter = g_cfg.safepoint_reload;
@@ -2250,6 +2270,17 @@ void compile_chunk(const BytecodeChunk& chunk) noexcept {
     const uint32_t ordinal = g_cfg.seen++;
     if (ordinal < g_cfg.skip || ordinal >= g_cfg.skip + g_cfg.limit) {
         chunk.jit_state = 2;
+        return;
+    }
+    // Decoding and emitting a function's code takes memory proportional to it
+    // (tens of megabytes for a bundle's multi-hundred-kilobyte top level) before
+    // any verdict on it, and a function that large is run once or loops inside
+    // callees the JIT compiles on their own -- so it is refused by size alone.
+    if (chunk.code.size() > g_cfg.max_chunk_bytes) {
+        chunk.jit_state = 2;
+        g_cfg.refused++;
+        if (g_cfg.log) std::fprintf(stderr, "[jit] refused (too large): %u bytes of bytecode\n",
+                                    static_cast<unsigned>(chunk.code.size()));
         return;
     }
     try {
