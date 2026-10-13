@@ -2386,6 +2386,13 @@ bool osr(Frame& f, uint32_t target, const Value& acc) noexcept {
 }  // namespace jit
 
 
-bool osr_try(Frame& f, uint32_t target_pc, const Value& acc) { return jit::osr(f, target_pc, acc); }
+bool osr_try(Frame& f, uint32_t target_pc, const Value& acc) {
+    if (jit::osr(f, target_pc, acc)) return true;
+    // Declined: the offer is made once per activation. Leaving the budget below
+    // zero would make every later back edge of this loop pay for another call
+    // that gets the same answer.
+    f.osr_budget = INT32_MAX;
+    return false;
+}
 
 #endif  // QUANTA_JIT_X64

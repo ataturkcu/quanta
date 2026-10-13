@@ -35,6 +35,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <bit>
+#include <algorithm>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <optional>
 
 #ifndef LIKELY
@@ -8757,7 +8762,7 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
 #endif
 
 // Where a frame starts or resumes: in generated code when the chunk has any.
-inline Value run_entry(Frame& f) {
+[[gnu::always_inline]] inline Value run_entry(Frame& f) {
     if (JitCode* jc = f.chunk.jit.get()) return jit::run(f, jc);
     return run_dispatch(f);
 }
@@ -9057,7 +9062,32 @@ Value run(const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
     if (__builtin_expect(chunk.register_count > kInlineRegs, 0)) {
         return run_spilled(chunk, ctx, args, this_val, owner, initial_acc, call_info, final_lexical_env);
     }
-    Value inline_regs[kInlineRegs] = {};
+    // Only the chunk's own registers are initialized, two to a store. `= {}` on
+    // the whole bank wrote all 32 on every call -- 32 scalar stores, since
+    // `undefined` is not an all-zero pattern the compiler could memset -- when a
+    // typical function uses a handful. The unwritten tail is never read by
+    // bytecode (the compiler allocates registers densely below register_count)
+    // and the conservative stack scan already tolerates stale words elsewhere in
+    // the frame (env_saves below is left uninitialized for the same reason), so
+    // the only cost of leaving it is a possible false retention.
+    alignas(Value) unsigned char bank[kInlineRegs * sizeof(Value)];
+    Value* inline_regs = reinterpret_cast<Value*>(bank);
+    {
+        const uint64_t undef_bits = std::bit_cast<uint64_t>(Value());
+        // Parameters are copied into the first slots whether or not the chunk's
+        // own count says it needs them.
+        const uint16_t used = std::max<uint16_t>(chunk.register_count, chunk.parameter_count);
+#if defined(__SSE2__)
+        const __m128i pair = _mm_set1_epi64x(static_cast<long long>(undef_bits));
+        for (uint16_t i = 0; i < used; i += 2) {
+            _mm_store_si128(reinterpret_cast<__m128i*>(bank) + i / 2, pair);
+        }
+#else
+        for (uint16_t i = 0; i < used; i++) {
+            std::memcpy(bank + i * sizeof(Value), &undef_bits, sizeof undef_bits);
+        }
+#endif
+    }
     return run_with_regs(chunk, ctx, args, this_val, owner, initial_acc, call_info, inline_regs, final_lexical_env);
 }
 
