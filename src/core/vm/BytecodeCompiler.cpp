@@ -5245,6 +5245,7 @@ std::unique_ptr<BytecodeChunk> BytecodeCompiler::compile_attempt(
 
     constexpr size_t kEnvSlotPredictMax = 32;
     size_t flat_slot_counter = 0;
+    std::vector<std::string> late_bound_params;
     if (env_mode) {
         // Same reasoning as env_bound just below, for Function::call_tree_
         // walker's own pre-seeding insertions (__closure_<name>, __home_
@@ -5295,6 +5296,16 @@ std::unique_ptr<BytecodeChunk> BytecodeCompiler::compile_attempt(
         for (const auto& p : param_names) {
             bool resident = !selective || env_resident.count(p) > 0;
             if (!resident) continue;
+            // A captured parameter of a function whose other names live in
+            // registers is not seeded by the entry: its raw argument sits in a
+            // register and the body's first instructions copy it into the
+            // environment, after every local (and the rest parameter) has been
+            // created. Its slot follows theirs; predicted here it landed in front,
+            // and every guarded read of it then missed and walked the chain by name.
+            if (selective && !params_tdz) {
+                late_bound_params.push_back(p);
+                continue;
+            }
             if (flat_slot_counter < kEnvSlotPredictMax) {
                 auto cit = compiler.global_decl_count_.find(p);
                 if (cit != compiler.global_decl_count_.end() && cit->second == 1) {
@@ -5576,6 +5587,18 @@ std::unique_ptr<BytecodeChunk> BytecodeCompiler::compile_attempt(
                 }
             }
         }
+    }
+
+    // The captured parameters the entry bytecode copies into the environment come
+    // after everything the entry created (see where they were set aside above).
+    for (const auto& p : late_bound_params) {
+        if (flat_slot_counter < kEnvSlotPredictMax) {
+            auto cit = compiler.global_decl_count_.find(p);
+            if (cit != compiler.global_decl_count_.end() && cit->second == 1) {
+                compiler.env_slot_info_[p] = {static_cast<uint8_t>(flat_slot_counter), 0};
+            }
+        }
+        flat_slot_counter++;
     }
 
     // Op::BindEnvLocals already decides where the body's bindings go, and it
