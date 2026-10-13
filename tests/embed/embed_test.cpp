@@ -1218,6 +1218,51 @@ static void test_accessor_redefined_in_setter() {
                      "return results[0] === results[1]; })()").as_boolean());
 }
 
+// Results the interpreter's fast paths must give exactly as the general paths do: each
+// of these takes a shortcut (a shared transition cache, bit-decided loose equality, a
+// call that writes nothing to the caller's context, a predicted environment slot, ...)
+// whose guard a later change can break without any crash to show for it.
+static void test_vm_fast_path_semantics() {
+    std::unique_ptr<Embed::Isolate> isolate = Embed::Isolate::Create();
+    std::unique_ptr<Embed::Realm> realm = isolate->CreateRealm();
+    Embed::Realm& r = *realm;
+    auto js = [&](const char* e) { return eval_in(r, e).to_string(); };
+
+    // A constructor shared by more "classes" than a site can remember, then an inherited
+    // setter / read-only property appearing on one of the prototypes after the caches are warm.
+    const char* shared_ctor =
+        "(function() { var cs = [];"
+        " for (var i = 0; i < 12; i++) { var C = function() { this.init.apply(this, arguments); };"
+        "   var p = {}; p.init = function(v) { this.v = v; this.tag = 'c'; }; C.prototype = p; cs.push(C); }"
+        " for (var r = 0; r < 4; r++) for (var i = 0; i < 12; i++) new cs[i](i);";
+    CHECK(js((std::string(shared_ctor) +
+              " Object.defineProperty(cs[5].prototype, 'tag', { set: function(x) { this._t = 'set:' + x; },"
+              "   get: function() { return this._t; }, configurable: true });"
+              " var x = new cs[5](1), y = new cs[4](1);"
+              " return [Object.keys(x).join(), x.tag, Object.keys(y).join(), y.tag].join('|'); })()").c_str()) ==
+          "v,_t|set:c|v,tag|c");
+    CHECK(js((std::string(shared_ctor) +
+              " Object.defineProperty(cs[4].prototype, 'v', { value: 99, writable: false });"
+              " var x = new cs[4](1), y = new cs[3](1);"
+              " return [x.v, Object.keys(x).join(), y.v].join('|'); })()").c_str()) == "99|tag|1");
+    // Loose equality decided by the values' bits.
+    CHECK(js("[null == undefined, null == 0, undefined == null, ({}) == ({}), (o => o == o)({}), true == true,"
+             " true == 1, '1' == 1, null != undefined, ({}) != null, undefined != 0].join()") ==
+          "true,false,true,false,true,true,true,true,false,true,true");
+    // A captured parameter next to locals; the slot the compiler predicts for it.
+    CHECK(js("(function() { function f(a, b) { var c = a + b; return function() { a++; return [a, b, c].join(); }; }"
+             " var g = f(1, 2); return g() + '|' + g(); })()") == "2,2,3|3,2,3");
+    // `this` for calls that write nothing to the caller's context.
+    CHECK(js("(function() { function s() { return typeof this; } function t() { 'use strict'; return typeof this; }"
+             " return [s.call(1), t.call(1), s.call(null), t.call(null), t.call(undefined)].join(); })()") ==
+          "object,number,object,object,undefined");
+    // Unary fast paths.
+    CHECK(js("[~5, ~-1, ~'7', ~1.9, ~4294967295, +'3', -'4'].join()") == "-6,0,-8,-2,0,3,-4");
+    // new on plain constructors.
+    CHECK(js("(function() { function A() { this.x = 1; } function B() { return { y: 2 }; } function C() { return 5; }"
+             " return [new A().x, new B().y, typeof new C()].join(); })()") == "1,2,object");
+}
+
 static Object* g_elem_proto;
 struct Elem : DOMObject {};
 
@@ -3006,6 +3051,7 @@ int main() {
     test_lone_surrogates();
     test_arrow_arguments();
     test_accessor_redefined_in_setter();
+    test_vm_fast_path_semantics();
     test_proxy_get_and_construct_reads();
     test_objects_and_conversions();
     test_buffers_zero_copy();

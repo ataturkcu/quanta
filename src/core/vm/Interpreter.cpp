@@ -524,8 +524,11 @@ void learn_transition(FeedbackSlot* fb_slot, Shape* from_shape, Shape* to_shape,
         Collector::write_barrier(owner);
         mark_owner_feedback_dirty(owner);
     }
+    // Same shape AND same prototype: a constructor shared by several "classes" sees
+    // the same shapes under different prototypes, and replacing on the shape alone
+    // had each of them evict the last one on every write.
     for (uint8_t i = 0; i < fb.transition_count; i++) {
-        if (fb.transitions[i].from_shape == from_shape) {
+        if (fb.transitions[i].from_shape == from_shape && fb.transitions[i].prototype == prototype) {
             fb.transitions[i] = {from_shape, to_shape, prototype, slot_index, epoch};
             return;
         }
@@ -626,11 +629,25 @@ struct MegaEntry {
     uint32_t slot = 0;
     enum Kind : uint8_t { Unusable = 0, Own = 1, ProtoSlot = 2 } kind = Unusable;
 };
-constexpr size_t kMegaEntries = 1024;
+constexpr size_t kMegaEntries = 2048;
 constinit thread_local MegaEntry g_mega[kMegaEntries];
 
-inline MegaEntry& mega_entry(const Shape* shape, const std::string* name) {
-    return g_mega[((reinterpret_cast<uintptr_t>(shape) >> 5) ^ (reinterpret_cast<uintptr_t>(name) >> 4)) & (kMegaEntries - 1)];
+// The receiver's prototype is part of the index. Instances of every "class" a shared
+// constructor makes start from the same empty shape, so (shape, name) alone is one
+// entry that twelve prototypes take turns evicting; with the prototype in the hash
+// each of them keeps its own.
+// Objects are allocated at a fixed stride, so neighbouring prototypes differ only in low
+// bits that a shift-and-xor folds onto each other; each pointer is multiplied by an odd
+// constant first and the table index is taken from the high bits of the sum.
+inline size_t mega_hash(const void* a, const void* b, const void* c, size_t mask) {
+    const uint64_t h = (reinterpret_cast<uintptr_t>(a) >> 5) * 0x9E3779B97F4A7C15ull +
+                       (reinterpret_cast<uintptr_t>(b) >> 4) * 0xC2B2AE3D27D4EB4Full +
+                       (reinterpret_cast<uintptr_t>(c) >> 5) * 0x165667B19E3779F9ull;
+    return static_cast<size_t>(h >> 40) & mask;
+}
+
+inline MegaEntry& mega_entry(const Shape* shape, const std::string* name, const Object* proto) {
+    return g_mega[mega_hash(shape, name, proto, kMegaEntries - 1)];
 }
 
 // A key the general path might answer from somewhere a shape slot does not show: an
@@ -643,7 +660,7 @@ inline bool mega_probe(const Object* obj, const std::string* name, Value& out) {
     if (obj->get_type() != Object::ObjectType::Ordinary) return false;
     Shape* shape = obj->get_shape();
     if (!shape || obj->has_any_descriptor_override()) return false;
-    const MegaEntry& e = mega_entry(shape, name);
+    const MegaEntry& e = mega_entry(shape, name, obj->get_prototype_raw());
     if (e.shape != shape || e.name != name || e.generation != Collector::sweep_generation()) return false;
     if (e.kind == MegaEntry::Own) {
         const Value* slot = obj->get_shape_slot_unchecked(e.slot);
@@ -667,17 +684,24 @@ inline void mega_learn(Object* obj, const std::string* name) {
     if (obj->get_type() != Object::ObjectType::Ordinary || !mega_name_ok(*name)) return;
     Shape* shape = obj->get_shape();
     if (!shape || obj->has_any_descriptor_override()) return;
-    MegaEntry& e = mega_entry(shape, name);
-    if (e.shape == shape && e.name == name && e.generation == Collector::sweep_generation()) return;   // already decided
+    Object* const proto0 = obj->get_prototype_raw();
+    MegaEntry& e = mega_entry(shape, name, proto0);
+    // Already decided -- for an own property that is the end of it, but anything that was
+    // answered from the prototype chain (a prototype slot, or "not cacheable") is only true
+    // for this prototype in this epoch: an entry left from before the chain last changed
+    // used to stop the site relearning, so it missed on every read until the next sweep.
+    if (e.shape == shape && e.name == name && e.generation == Collector::sweep_generation() &&
+        (e.kind == MegaEntry::Own || (e.proto == proto0 && e.epoch == Object::proto_epoch()))) return;
     MegaEntry fresh;
     fresh.shape = shape;
     fresh.name = name;
+    fresh.proto = proto0;
+    fresh.epoch = Object::proto_epoch();
     fresh.generation = Collector::sweep_generation();
     const int32_t own = shape->find_slot(*name);
     if (own >= 0) {
         if (shape->find_data_slot(*name) >= 0) { fresh.kind = MegaEntry::Own; fresh.slot = static_cast<uint32_t>(own); }
     } else {
-        Object* const proto0 = obj->get_prototype_raw();
         Object* p = proto0;
         for (int depth = 0; p && depth < 16; depth++, p = p->get_prototype_raw()) {
             if (p->get_type() != Object::ObjectType::Ordinary) break;
@@ -696,6 +720,53 @@ inline void mega_learn(Object* obj, const std::string* name) {
         }
     }
     e = fresh;
+}
+
+// The write-side counterpart: the shape a store that adds `name` moves an object to, for
+// the sites that have seen more (shape, prototype) pairs than a site can hold (a constructor
+// shared by a dozen "classes"). Keyed on the receiver's shape, the name and its
+// prototype; valid for one proto_epoch and one sweep generation, for the reasons the
+// read cache above gives. Only an Ordinary extensible receiver with no descriptor map
+// at all is served, so nothing but the shape decides where the property goes.
+struct MegaTransition {
+    Shape* from = nullptr;
+    Shape* to = nullptr;
+    const std::string* name = nullptr;
+    const Object* proto = nullptr;
+    uint64_t epoch = 0;
+    uint64_t generation = ~0ull;
+};
+constexpr size_t kMegaTransitions = 1024;
+constinit thread_local MegaTransition g_mega_trans[kMegaTransitions];
+
+inline MegaTransition& mega_transition_entry(const Shape* from, const std::string* name, const Object* proto) {
+    return g_mega_trans[mega_hash(from, name, proto, kMegaTransitions - 1)];
+}
+
+inline Shape* mega_transition_probe(const Object* obj, const std::string* name) {
+    if (obj->get_type() != Object::ObjectType::Ordinary || !obj->is_extensible()) return nullptr;
+    Shape* from = obj->get_shape();
+    if (!from || obj->has_any_descriptor_override()) return nullptr;
+    const Object* proto = obj->get_prototype_raw();
+    const MegaTransition& e = mega_transition_entry(from, name, proto);
+    if (e.from != from || e.name != name || e.proto != proto || e.epoch != Object::proto_epoch() ||
+        e.generation != Collector::sweep_generation()) return nullptr;
+    return e.to;
+}
+
+inline void mega_transition_learn(Shape* from, Shape* to, const std::string& name, const Object* obj) {
+    if (!from || !to || to == from || obj->get_type() != Object::ObjectType::Ordinary || !mega_name_ok(name)) return;
+    // The shape must be `from` plus exactly this property: a store that ran an inherited
+    // setter moves the object too, to a shape that has some other property the setter's
+    // body added, and replaying that for a plain store would skip the setter.
+    const int32_t at = to->find_slot(name);
+    if (at < 0 || to->slot_count() != from->slot_count() + 1 ||
+        static_cast<uint32_t>(at) != from->slot_count() || to->is_accessor_slot(name)) return;
+    const std::string* key = Shape::intern_existing(name);
+    if (!key) return;
+    const Object* proto = obj->get_prototype_raw();
+    MegaTransition& e = mega_transition_entry(from, key, proto);
+    e = {from, to, key, proto, Object::proto_epoch(), Collector::sweep_generation()};
 }
 
 // A shape match alone doesn't prove "plain data slot, no override" -- both
@@ -1344,6 +1415,12 @@ void set_named(Context& ctx, const Value& receiver, const std::string& name,
             learn_transition(fb_slot, shape_before, s, obj->get_prototype_raw(),
                               static_cast<uint32_t>(idx), Object::proto_epoch(), owner, rooted);
         }
+    }
+    // A site whose own cache is spent still records what it learned where every site
+    // can see it (see MegaTransition).
+    else if (was_new && ok && fb_slot && fb && fb->transition_mega &&
+             shape_fast_path_ok(obj->get_type()) && !obj->has_descriptor_override(name)) {
+        mega_transition_learn(shape_before, obj->get_shape(), name, obj);
     }
 }
 
@@ -7462,6 +7539,14 @@ Value h_SetNamedRest(Frame& f, uint32_t pc, Value acc) {
                     if (obj->has_descriptor_override(name)) break;
                     write_barrier_for(obj, acc);
                     obj->add_shape_property_cached(name, acc, te.to_shape);
+                    pc += 6;
+                    DISPATCH();
+                }
+            } else if (fb.transition_mega) {
+                const std::string& name = f.chunk.name_at(read_u16(code, pc + 2));
+                if (Shape* to = mega_transition_probe(obj, &name)) {
+                    write_barrier_for(obj, acc);
+                    obj->add_shape_property_cached(name, acc, to);
                     pc += 6;
                     DISPATCH();
                 }
