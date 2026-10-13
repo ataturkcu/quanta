@@ -539,6 +539,112 @@ inline void write_barrier_for(Object* obj, const Value& value) {
     Collector::write_barrier(obj);
 }
 
+// The property cache a megamorphic site falls back to. A site learns at most a few
+// shapes (see FeedbackSlot::kMaxEntries); past that it used to resolve every read
+// from scratch -- two hash lookups per object on the chain, about four hundred
+// cycles. That is what a function shared by many classes does, and
+// `this.initialize.apply(this, arguments)` in a "class" factory (the Prototype.js
+// idiom) is exactly that: one function, every class's instances. This cache is
+// shared by all sites, keyed on (receiver shape, interned name), so a read
+// that any site has resolved before costs a few compares.
+//
+// What it holds is deliberately narrow: an Ordinary receiver with no descriptor
+// overrides, and a plain data property in a shape slot, either its own or on
+// the prototype chain with nothing between that could shadow it.
+// Accessors, descriptor-map properties (class methods), absent keys and every
+// exotic type stay with the general path. A "tried, not cacheable" entry stops a
+// site that can never hit from re-deriving that on every read.
+//
+// Safety, since the entries keep raw pointers without keeping the cells alive:
+//  - shapes are immortal (the transition tree owns them) and names are interned, so
+//    comparing them by address is sound;
+//  - the prototype and holder are not, and an address freed and reused would
+//    otherwise match an entry that no longer describes it -- so every entry carries
+//    the collector's sweep generation and is empty once any cell may have been freed;
+//  - a prototype chain that changes in any way moves Object::proto_epoch(), and an
+//    entry is valid for one epoch only, the rule FeedbackSlot::ProtoEntry follows.
+struct MegaEntry {
+    Shape* shape = nullptr;
+    const std::string* name = nullptr;
+    Object* proto = nullptr;    // the receiver's [[Prototype]] when learned (prototype entries)
+    Object* holder = nullptr;   // the object whose slot holds the value
+    uint64_t epoch = 0;
+    uint64_t generation = ~0ull;
+    uint32_t slot = 0;
+    enum Kind : uint8_t { Unusable = 0, Own = 1, ProtoSlot = 2 } kind = Unusable;
+};
+constexpr size_t kMegaEntries = 1024;
+constinit thread_local MegaEntry g_mega[kMegaEntries];
+
+inline MegaEntry& mega_entry(const Shape* shape, const std::string* name) {
+    return g_mega[((reinterpret_cast<uintptr_t>(shape) >> 5) ^ (reinterpret_cast<uintptr_t>(name) >> 4)) & (kMegaEntries - 1)];
+}
+
+// A key the general path might answer from somewhere a shape slot does not show: an
+// element, a private name, the legacy accessor.
+inline bool mega_name_ok(const std::string& name) {
+    return !name.empty() && !(name[0] >= '0' && name[0] <= '9') && name[0] != '#' && name != "__proto__";
+}
+
+inline bool mega_probe(const Object* obj, const std::string* name, Value& out) {
+    if (obj->get_type() != Object::ObjectType::Ordinary) return false;
+    Shape* shape = obj->get_shape();
+    if (!shape || obj->has_any_descriptor_override()) return false;
+    const MegaEntry& e = mega_entry(shape, name);
+    if (e.shape != shape || e.name != name || e.generation != Collector::sweep_generation()) return false;
+    if (e.kind == MegaEntry::Own) {
+        const Value* slot = obj->get_shape_slot_unchecked(e.slot);
+        if (!slot) return false;
+        out = *slot;
+        return true;
+    }
+    if (e.kind == MegaEntry::ProtoSlot && e.proto == obj->get_prototype_raw() && e.epoch == Object::proto_epoch()) {
+        const Value* slot = e.holder->get_shape_slot_unchecked(e.slot);
+        if (!slot) return false;
+        out = *slot;
+        return true;
+    }
+    return false;
+}
+
+// Works out what a read of `name` on `obj` resolves to and records it, if it is a
+// shape slot. Called after the general path has answered, so a miss costs a second
+// walk once per (shape, name) per sweep generation, never per read.
+inline void mega_learn(Object* obj, const std::string* name) {
+    if (obj->get_type() != Object::ObjectType::Ordinary || !mega_name_ok(*name)) return;
+    Shape* shape = obj->get_shape();
+    if (!shape || obj->has_any_descriptor_override()) return;
+    MegaEntry& e = mega_entry(shape, name);
+    if (e.shape == shape && e.name == name && e.generation == Collector::sweep_generation()) return;   // already decided
+    MegaEntry fresh;
+    fresh.shape = shape;
+    fresh.name = name;
+    fresh.generation = Collector::sweep_generation();
+    const int32_t own = shape->find_slot(*name);
+    if (own >= 0) {
+        if (shape->find_data_slot(*name) >= 0) { fresh.kind = MegaEntry::Own; fresh.slot = static_cast<uint32_t>(own); }
+    } else {
+        Object* const proto0 = obj->get_prototype_raw();
+        Object* p = proto0;
+        for (int depth = 0; p && depth < 16; depth++, p = p->get_prototype_raw()) {
+            if (p->get_type() != Object::ObjectType::Ordinary) break;
+            Shape* ps = p->get_shape();
+            if (!ps || p->has_any_descriptor_override()) break;
+            const int32_t at = ps->find_slot(*name);
+            if (at < 0) continue;                                   // not here: look further up
+            if (ps->find_data_slot(*name) >= 0) {                  // a data property; an accessor ends the search
+                fresh.kind = MegaEntry::ProtoSlot;
+                fresh.proto = proto0;
+                fresh.holder = p;
+                fresh.epoch = Object::proto_epoch();
+                fresh.slot = static_cast<uint32_t>(at);
+            }
+            break;
+        }
+    }
+    e = fresh;
+}
+
 // A shape match alone doesn't prove "plain data slot, no override" -- both
 // the hit check and the miss-path refill re-verify has_descriptor_override.
 // has_descriptor_override is a fact about (obj, name), independent of which
@@ -6531,8 +6637,14 @@ Value h_gen_GetNamed(Frame& f, uint32_t pc, Value acc) {
                 uint16_t name_idx = read_u16(code, pc + 1);
                 uint16_t fb_idx = read_u16(code, pc + 3);
                 pc += 5;
+                // Read before the call: a getter can write the register.
+                Object* const learn_from = regs[obj_reg].is_object() ? regs[obj_reg].as_object() : nullptr;
                 acc = get_named(ctx, regs[obj_reg], chunk.name_at(name_idx), &chunk.feedback[fb_idx], owner, f.feedback_rooted);
                 CHECK_EXC();
+                if (learn_from) {
+                    const FeedbackBody* site = chunk.feedback[fb_idx].peek();
+                    if (site && (site->mega || site->proto_mega)) mega_learn(learn_from, &chunk.name_at(name_idx));
+                }
                 break;
             }
     } while (0);
@@ -6939,6 +7051,14 @@ Value h_GetNamedRest(Frame& f, uint32_t pc, Value acc) {
                 acc = fb.prim_value;
                 FUSED_TAIL(6);
             }
+        }
+    }
+    // Past the site's own entries: the shared cache for what it cannot hold.
+    if (receiver.is_object()) {
+        Value cached;
+        if (mega_probe(receiver.as_object(), &f.chunk.name_at(read_u16(code, pc + 2)), cached)) {
+            acc = cached;
+            FUSED_TAIL(6);
         }
     }
     [[clang::musttail]] return h_gen_GetNamed(f, pc, acc);

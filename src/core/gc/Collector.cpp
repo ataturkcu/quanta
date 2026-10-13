@@ -59,6 +59,7 @@
 namespace Quanta {
 
 constinit thread_local bool Collector::major_in_progress_ = false;
+constinit thread_local uint64_t Collector::sweep_generation_ = 0;
 int Collector::stress_mode_ = -1;  // -1: not resolved yet, reads as armed
 
 namespace {
@@ -945,6 +946,7 @@ void run_verify(Collector::CycleStats& stats) {
 namespace {
 
 void run_minor_collection() {
+    ++Collector::sweep_generation_;
     static const bool verify = env_flag("QUANTA_GC_VERIFY");
     static const bool log = env_flag("QUANTA_GC_LOG");
     static const bool prof = env_flag("QUANTA_GC_PROFILE");
@@ -1156,6 +1158,7 @@ constinit thread_local uint32_t g_major_slice_count = 0;
 // gray_/context_work_/environment_work_ are all genuinely empty -- the one
 // point where "not yet reached" and "unreachable" can't be confused.
 void finish_major_cycle(MarkVisitor& v) {
+    ++Collector::sweep_generation_;
     static const bool verify = env_flag("QUANTA_GC_VERIFY");
     static const bool log = env_flag("QUANTA_GC_LOG");
     static const bool prof = env_flag("QUANTA_GC_PROFILE");
@@ -1403,6 +1406,7 @@ std::chrono::microseconds next_slice_budget() {
 }
 
 void Collector::retire_heap(Heap* heap) {
+    ++sweep_generation_;
     Heap::set_retiring(heap);
     collect();
     Heap::set_retiring(nullptr);

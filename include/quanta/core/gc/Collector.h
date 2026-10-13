@@ -57,6 +57,15 @@ public:
     // read directly by safepoint() above and by the barriers in Collector.cpp.
     static constinit thread_local bool major_in_progress_;
 
+    // Counts the points at which cells may be freed: the start of every minor
+    // collection, of every major's sweep, and of a heap's teardown. A cache that
+    // keeps a raw pointer to a cell without keeping the cell alive (see the
+    // megamorphic property cache in Interpreter.cpp) stamps its entries with this
+    // and treats a different value as empty, because an address freed in between can
+    // be handed to an unrelated object and match an entry that no longer describes it.
+    static uint64_t sweep_generation() { return sweep_generation_; }
+    static constinit thread_local uint64_t sweep_generation_;
+
     // QUANTA_GC_STRESS, resolved on the first safepoint_slow(). Starts at -1
     // ("not resolved yet"), which reads as armed, so the inline test above
     // can never skip a stress-mode collection before the value is known and
