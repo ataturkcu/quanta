@@ -8477,8 +8477,14 @@ Value h_gen_CreateRestArray(Frame& f, uint32_t pc, Value acc) {
                 uint8_t start_index = code[pc];
                 pc += 1;
                 auto rest_array = ObjectFactory::create_array(0);
-                for (size_t j = start_index; j < args.size(); j++) {
-                    rest_array->push(args[j]);
+                // The count is known, so the length is set and the storage sized once,
+                // the way CreateArray does, instead of every push re-deriving the
+                // length and growing the elements by one.
+                if (args.size() > start_index) {
+                    const uint32_t n = static_cast<uint32_t>(args.size() - start_index);
+                    rest_array->set_length(n);
+                    rest_array->reserve_elements(n);
+                    for (uint32_t j = 0; j < n; j++) rest_array->set_element(j, args[start_index + j]);
                 }
                 Engine::fixup_new_array_realm(rest_array.get(), &ctx);
                 acc = Value(rest_array.release());
