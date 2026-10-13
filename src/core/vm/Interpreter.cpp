@@ -455,8 +455,14 @@ void learn_feedback(FeedbackSlot* fb_slot, Shape* shape, uint32_t slot_index, bo
 // this path.
 inline bool shape_fast_path_ok(Object::ObjectType t) {
     using OT = Object::ObjectType;
-    return t == OT::Ordinary || t == OT::Date || t == OT::RegExp ||
-           t == OT::Error || t == OT::Promise;
+    // One bit test against a constant mask rather than five compares: this runs
+    // on every property read and write, ahead of the cache lookup.
+    constexpr uint32_t kMask = (1u << static_cast<unsigned>(OT::Ordinary)) |
+                               (1u << static_cast<unsigned>(OT::Date)) |
+                               (1u << static_cast<unsigned>(OT::RegExp)) |
+                               (1u << static_cast<unsigned>(OT::Error)) |
+                               (1u << static_cast<unsigned>(OT::Promise));
+    return (kMask >> (static_cast<unsigned>(t) & 31u)) & 1u;
 }
 
 // Function::get_property intercepts exactly these five names before an

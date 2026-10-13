@@ -684,20 +684,35 @@ struct FeedbackSlot {
     using TransitionEntry = FeedbackBody::TransitionEntry;
     using ProtoEntry = FeedbackBody::ProtoEntry;
 
-    std::unique_ptr<FeedbackBody> body;
+    // Never null: a site that has learned nothing points at the shared empty
+    // body, so the readers on the property-access path load it and look at it
+    // without first asking whether it is there. The slot owns its body unless
+    // it is that one.
+    FeedbackBody* body_ = const_cast<FeedbackBody*>(&kEmpty);
 
-    // Null while the site has learned nothing, which every reader already
-    // treats as a miss -- the same answer an all-zero body would give.
-    FeedbackBody* peek() const { return body.get(); }
-    // For readers that would rather not carry the null: an untouched body
-    // answers every question with the miss the absent one means. A namespace
-    // static, not a function-local one, so reading it costs no guard on a
-    // path the interpreter takes for every property access.
+    FeedbackSlot() = default;
+    FeedbackSlot(const FeedbackSlot&) = delete;
+    FeedbackSlot& operator=(const FeedbackSlot&) = delete;
+    FeedbackSlot(FeedbackSlot&& o) noexcept : body_(o.body_) { o.body_ = const_cast<FeedbackBody*>(&kEmpty); }
+    FeedbackSlot& operator=(FeedbackSlot&& o) noexcept {
+        if (this != &o) { reset(); body_ = o.body_; o.body_ = const_cast<FeedbackBody*>(&kEmpty); }
+        return *this;
+    }
+    ~FeedbackSlot() { reset(); }
+
+    // The shared answer an untouched body gives to every question: a miss. A
+    // namespace static, not a function-local one, so reading it costs no guard
+    // on a path the interpreter takes for every property access.
     static const FeedbackBody kEmpty;
-    const FeedbackBody& read() const { return body ? *body : kEmpty; }
+    // Null while the site has learned nothing, for the writers that want to know.
+    FeedbackBody* peek() const { return body_ == &kEmpty ? nullptr : body_; }
+    const FeedbackBody& read() const { return *body_; }
     FeedbackBody& ensure() {
-        if (!body) body = std::make_unique<FeedbackBody>();
-        return *body;
+        if (body_ == &kEmpty) body_ = new FeedbackBody();
+        return *body_;
+    }
+    void reset() {
+        if (body_ != &kEmpty) { delete body_; body_ = const_cast<FeedbackBody*>(&kEmpty); }
     }
 };
 

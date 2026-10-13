@@ -44,7 +44,7 @@ void BytecodeChunk::drop_feedback() const {
     // later can be handed the same addresses: a stale entry would then hit and
     // return the old realm's object. Forgetting them is what keeps the two in step.
     if (jit) jit_forget_cells(jit.get());
-    for (const auto& slot : feedback) const_cast<FeedbackSlot&>(slot).body.reset();
+    for (const auto& slot : feedback) const_cast<FeedbackSlot&>(slot).reset();
     if (ic_feedback) {
         for (auto& kfb : ic_feedback->keyed_feedback) kfb.reset();
     }
