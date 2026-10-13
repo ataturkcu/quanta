@@ -21,7 +21,7 @@ The loop is: write the micro-benchmark for the thing, annotate the function that
 
 ## Where the instructions go
 
-A large real-world program (a 3 MB minified player script, 482 million bytecodes, ~37 G instructions after this work, ~77 per bytecode) spends them roughly like this:
+A large real-world program (a 3 MB minified player script, 482 million bytecodes, ~36 G instructions after this work, ~77 per bytecode) spends them roughly like this:
 
 | | share |
 |---|---|
@@ -62,7 +62,7 @@ Measured with the benchmark suite in `count.sh` (Richards, DeltaBlue, RayTrace, 
 
 **Smaller things:** register-bank initialisation, the argument copy (a plain loop; left alone the compiler turns it into a `memcpy` call that costs more than the copy for one to three arguments), frameless `Jump`/`JumpIf`/bitwise handlers and `read_*` helpers that compile to single loads, `h_BackEdgeDue` as the only place a loop back-edge reaches the collector or the JIT.
 
-Taken together: the suite is −8.5% against the start of this round, and the real-world script went from 41.5 G to ~36.5 G instructions (−12%).
+Taken together: the suite is −8.5% against the start of this round, and the real-world script went from 41.5 G to ~35.8 G instructions (−14%).
 
 ## Tried and not kept
 

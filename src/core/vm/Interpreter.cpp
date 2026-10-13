@@ -3052,6 +3052,30 @@ Value h_gen_ToNumeric(Frame& f, uint32_t pc, Value acc) {
     DISPATCH();
 }
 
+// ToNumeric of something already a number is that number, and `~x` of a number that
+// fits an int is two instructions; both used to go through the generated handlers
+// and out-of-line conversions (about seventy instructions for `~str.indexOf(..)`,
+// which minified code uses constantly).
+Value h_ToNumericFast(Frame& f, uint32_t pc, Value acc) {
+    if (LIKELY(acc.is_number())) {
+        pc += 1;
+        DISPATCH();
+    }
+    [[clang::musttail]] return h_gen_ToNumeric(f, pc, acc);
+}
+
+Value h_BitNotFast(Frame& f, uint32_t pc, Value acc) {
+    if (LIKELY(acc.is_finite_double())) {
+        int32_t i;
+        if (LIKELY(to_int32_by_cast(acc.as_finite_double(), i))) {
+            acc = Value(static_cast<double>(~i));
+            pc += 1;
+            DISPATCH();
+        }
+    }
+    [[clang::musttail]] return h_gen_BitNot(f, pc, acc);
+}
+
 Value h_gen_ToTemplateString(Frame& f, uint32_t pc, Value acc) {
     const BytecodeChunk& chunk = f.chunk;
     Context& ctx = *f.ctx;
@@ -9013,12 +9037,12 @@ constexpr std::array<Handler, 256> make_handler_table() {
     t[static_cast<uint8_t>(Op::LdaArgAt)] = &h_LdaArgAt;
     t[static_cast<uint8_t>(Op::Neg)] = &h_gen_Neg;
     t[static_cast<uint8_t>(Op::LogicalNot)] = &h_LogicalNotFast;
-    t[static_cast<uint8_t>(Op::BitNot)] = &h_gen_BitNot;
+    t[static_cast<uint8_t>(Op::BitNot)] = &h_BitNotFast;
     t[static_cast<uint8_t>(Op::TypeOf)] = &h_gen_TypeOf;
     t[static_cast<uint8_t>(Op::Yield)] = &h_gen_Yield;
     t[static_cast<uint8_t>(Op::Await)] = &h_gen_Await;
     t[static_cast<uint8_t>(Op::ToNumber)] = &h_gen_ToNumber;
-    t[static_cast<uint8_t>(Op::ToNumeric)] = &h_gen_ToNumeric;
+    t[static_cast<uint8_t>(Op::ToNumeric)] = &h_ToNumericFast;
     t[static_cast<uint8_t>(Op::ToTemplateString)] = &h_gen_ToTemplateString;
     t[static_cast<uint8_t>(Op::BuildTemplateString)] = &h_gen_BuildTemplateString;
     t[static_cast<uint8_t>(Op::ToPropertyKey)] = &h_gen_ToPropertyKey;
