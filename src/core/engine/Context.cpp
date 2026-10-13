@@ -1300,12 +1300,13 @@ bool Environment::create_binding_interned(const std::string* key, const Value& v
         return create_binding(*key, value, mutable_binding, true, true);
     }
     // Same refusal as create_binding: an existing binding is not redefined.
-    if (slots_.find_interned(key)) return false;
     // Never deletable: every caller is seeding a scope the compiler emitted --
     // parameters, function-level vars, a block or a catch parameter -- and the
     // spec creates all of those with CreateMutableBinding(N, false). Only eval
     // code makes a deletable var, and eval is never compiled.
-    slots_.get_or_create_interned(key) = BindingSlot{value, mutable_binding, true, false};
+    BindingSlot* slot = slots_.create_interned_if_absent(key);
+    if (!slot) return false;
+    *slot = BindingSlot{value, mutable_binding, true, false};
     return true;
 }
 
@@ -1317,8 +1318,9 @@ void Environment::create_uninitialized_binding_interned(const std::string* key, 
     }
     // Same refusal as create_uninitialized_binding: re-creating would clear
     // the initialized flag and the const mark of a binding already made.
-    if (slots_.find_interned(key)) return;
-    slots_.get_or_create_interned(key) = BindingSlot{Value(), is_mutable, false, false};
+    if (BindingSlot* slot = slots_.create_interned_if_absent(key)) {
+        *slot = BindingSlot{Value(), is_mutable, false, false};
+    }
 }
 
 bool Environment::create_binding(const std::string& name, const Value& value, bool mutable_binding, bool deletable, bool enumerable) {

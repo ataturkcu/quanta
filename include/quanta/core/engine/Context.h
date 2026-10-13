@@ -750,6 +750,34 @@ public:
             return const_cast<SlotMap*>(this)->find_interned(key);
         }
 
+        // Creates the binding unless `key` is already bound, answering with its
+        // fresh slot or null. A scope being seeded asks this once per name and
+        // used to pay three scans of the entries for it: one to find the name,
+        // another inside get_or_create_interned to find it again, and a third
+        // for a free entry. One pass sees both the name and the first free
+        // entry. The overflow map is consulted even when a free entry turns
+        // up, since a name only lands there once the entries were full and an
+        // erase can have freed one since.
+        BindingSlot* create_interned_if_absent(const std::string* key) {
+            InlineEntry* free_entry_found = nullptr;
+            for (auto& e : inline_entries) {
+                if (e.key == key) return nullptr;
+                if (!e.key && !free_entry_found) free_entry_found = &e;
+            }
+            for (uint16_t i = 0; i < ext_capacity; i++) {
+                if (ext[i].key == key) return nullptr;
+                if (!ext[i].key && !free_entry_found) free_entry_found = &ext[i];
+            }
+            if (overflow && overflow->find(key) != overflow->end()) return nullptr;
+            if (free_entry_found) {
+                free_entry_found->key = key;
+                free_entry_found->slot = BindingSlot{};
+                return &free_entry_found->slot;
+            }
+            if (!overflow) overflow = std::make_unique<OverflowMap>();
+            return &(*overflow)[key];
+        }
+
         BindingSlot& get_or_create_interned(const std::string* key) {
             if (BindingSlot* existing = find_interned(key)) return *existing;
             if (InlineEntry* e = free_entry()) {

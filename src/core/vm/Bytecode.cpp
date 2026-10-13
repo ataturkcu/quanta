@@ -195,7 +195,7 @@ const OpInfo& op_info(Op op) {
         {"LdarStar", 2, 'r'}, {"LdaSmiStar", 2, 'I'},
         {"LdaConstStar", 3, 'K'}, {"LdaZeroStar", 1, 'r'},
         {"LdaThisStar", 1, 'r'}, {"LdaEnvStar", 3, 'N'}, {"LdaLookupStar", 3, 'N'},
-        {"LdaEnvSlotStar", 4, 'F'}, {"GetNamedStar", 6, 'G'},
+        {"LdaEnvSlotStar", 4, 'F'}, {"GetNamedStar", 6, 'G'}, {"LdaTdzStar", 1, 'r'},
         {"Yield", 0, '-'}, {"Await", 1, 'i'},
         {"LdaNewTarget", 0, '-'}, {"LdaImportMeta", 0, '-'},
         {"SettleReturn", 1, 'i'}, {"YieldStar", 0, '-'},

@@ -2355,6 +2355,52 @@ Value h_JumpIf(Frame& f, uint32_t pc, Value acc) {
 // half stays small enough to keep its operands in registers. Putting both in
 // one handler made every iteration of a numeric loop carry the prologue the
 // slow half needs -- chunk, ctx, instr_pc -- to reach a call it never makes.
+// What a comparison does with its boolean when the very next instruction is a
+// conditional jump, which is nearly always: leave it in the accumulator (the
+// jump's other readers get it as before) and take the branch here, instead of
+// dispatching to a handler whose first act is to test the tag of a boolean
+// this one just built. The jump is still its own instruction -- another path
+// can land on it -- and is only skipped by the path that falls into it.
+#define BRANCH_AFTER_COMPARE(truth)                                                   \
+    do {                                                                              \
+        const bool truth_ = (truth);                                                  \
+        acc = Value(truth_);                                                          \
+        pc += 2;                                                                      \
+        const uint8_t next_ = f.code[pc];                                             \
+        if (next_ == static_cast<uint8_t>(Op::JumpIfFalse) ||                         \
+            next_ == static_cast<uint8_t>(Op::JumpIfTrue)) {                          \
+            const int16_t off_ = read_i16(f.code, pc + 1);                            \
+            pc += 3;                                                                  \
+            if (truth_ == (next_ == static_cast<uint8_t>(Op::JumpIfTrue))) {          \
+                pc += off_;                                                           \
+                if (off_ < 0 && UNLIKELY(BACK_EDGE_DUE()))                            \
+                    [[clang::musttail]] return h_BackEdgeDue(f, pc, acc);             \
+            }                                                                         \
+        }                                                                             \
+        DISPATCH();                                                                   \
+    } while (0)
+
+#define NUMERIC_COMPARE_HANDLER(name, binop, cmp)                          \
+    Value name##_slow(Frame& f, uint32_t pc, Value acc) {                  \
+        const BytecodeChunk& chunk = f.chunk;                              \
+        Context& ctx = *f.ctx;                                              \
+        uint32_t& instr_pc = f.instr_pc;                                   \
+        instr_pc = pc;                                                     \
+        acc = binary_slow(ctx, binop, f.regs[f.code[pc + 1]], acc);        \
+        pc += 2;                                                           \
+        CHECK_EXC_TAIL();                                                  \
+        DISPATCH();                                                        \
+    }                                                                      \
+    Value name(Frame& f, uint32_t pc, Value acc) {                         \
+        const Value& lhs = f.regs[f.code[pc + 1]];                         \
+        if (LIKELY(lhs.is_finite_double() && acc.is_finite_double())) {    \
+            const double l = lhs.as_finite_double();                       \
+            const double r = acc.as_finite_double();                       \
+            BRANCH_AFTER_COMPARE(cmp);                                     \
+        }                                                                  \
+        [[clang::musttail]] return name##_slow(f, pc, acc);                \
+    }
+
 #define NUMERIC_BINARY_HANDLER(name, binop, expr)                          \
     Value name##_slow(Frame& f, uint32_t pc, Value acc) {                  \
         const BytecodeChunk& chunk = f.chunk;                              \
@@ -2407,12 +2453,12 @@ Value h_Mod(Frame& f, uint32_t pc, Value acc) {
 NUMERIC_BINARY_HANDLER(h_Add, BinOp::ADD, Value(l + r))
 NUMERIC_BINARY_HANDLER(h_Sub, BinOp::SUBTRACT, Value(l - r))
 NUMERIC_BINARY_HANDLER(h_Mul, BinOp::MULTIPLY, Value(l * r))
-NUMERIC_BINARY_HANDLER(h_TestLt, BinOp::LESS_THAN, Value(l < r))
-NUMERIC_BINARY_HANDLER(h_TestGt, BinOp::GREATER_THAN, Value(l > r))
-NUMERIC_BINARY_HANDLER(h_TestLe, BinOp::LESS_EQUAL, Value(l <= r))
-NUMERIC_BINARY_HANDLER(h_TestGe, BinOp::GREATER_EQUAL, Value(l >= r))
-NUMERIC_BINARY_HANDLER(h_TestEq, BinOp::EQUAL, Value(l == r))
-NUMERIC_BINARY_HANDLER(h_TestNe, BinOp::NOT_EQUAL, Value(l != r))
+NUMERIC_COMPARE_HANDLER(h_TestLt, BinOp::LESS_THAN, l < r)
+NUMERIC_COMPARE_HANDLER(h_TestGt, BinOp::GREATER_THAN, l > r)
+NUMERIC_COMPARE_HANDLER(h_TestLe, BinOp::LESS_EQUAL, l <= r)
+NUMERIC_COMPARE_HANDLER(h_TestGe, BinOp::GREATER_EQUAL, l >= r)
+NUMERIC_COMPARE_HANDLER(h_TestEq, BinOp::EQUAL, l == r)
+NUMERIC_COMPARE_HANDLER(h_TestNe, BinOp::NOT_EQUAL, l != r)
 // The strict comparisons settle most non-numeric operands without a frame: the
 // values' own bits decide (see strict_equal_quick), so only two strings, BigInts or
 // symbols reach the slow half. The macro's handler would have gone there for every
@@ -2432,9 +2478,7 @@ NUMERIC_BINARY_HANDLER(h_TestNe, BinOp::NOT_EQUAL, Value(l != r))
         const Value& lhs = f.regs[f.code[pc + 1]];                         \
         const int q = strict_equal_quick(lhs, acc);                        \
         if (LIKELY(q != 2)) {                                              \
-            acc = Value((q == 1) == (want_equal));                         \
-            pc += 2;                                                       \
-            DISPATCH();                                                    \
+            BRANCH_AFTER_COMPARE((q == 1) == (want_equal));                \
         }                                                                  \
         [[clang::musttail]] return name##_slow(f, pc, acc);                \
     }
@@ -2606,6 +2650,14 @@ Value h_LdaThisFast(Frame& f, uint32_t pc, Value acc) {
 
 // Writes a constant and cannot raise, so it needs none of the generated
 // handler's bookkeeping -- like the other constant loads above.
+Value h_LdaTdzStar(Frame& f, uint32_t pc, Value acc) {
+    (void)acc;
+    acc = Value::vm_tdz_sentinel();
+    f.regs[f.code[pc + 1]] = acc;
+    pc += 2;
+    DISPATCH();
+}
+
 Value h_LdaTdz(Frame& f, uint32_t pc, Value acc) {
     (void)acc;
     acc = Value::vm_tdz_sentinel();
@@ -8932,6 +8984,7 @@ constexpr std::array<Handler, 256> make_handler_table() {
     t[static_cast<uint8_t>(Op::Dec)]           = &h_Dec;
     t[static_cast<uint8_t>(Op::LdaThis)] = &h_LdaThisFast<false>;
     t[static_cast<uint8_t>(Op::LdaTdz)] = &h_LdaTdz;
+    t[static_cast<uint8_t>(Op::LdaTdzStar)] = &h_LdaTdzStar;
     t[static_cast<uint8_t>(Op::LdarChecked)] = &h_gen_LdarChecked;
     t[static_cast<uint8_t>(Op::StarChecked)] = &h_gen_StarChecked;
     t[static_cast<uint8_t>(Op::Div)] = &h_gen_Div;

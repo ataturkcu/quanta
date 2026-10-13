@@ -260,6 +260,7 @@ enum class Op : uint8_t {
     LdaLookupStar, // n16, dst
     LdaEnvSlotStar,// slot, n16, dst
     GetNamedStar,  // recv, n16, fb16, dst
+    LdaTdzStar,    // dst
 
     // Suspends the generator or async generator this body is running in, with
     // the value in the accumulator, and resumes with what next() sent -- the
