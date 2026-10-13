@@ -170,6 +170,25 @@ inline int strict_equal_quick(const Value& a, const Value& b) {
     return 0;
 }
 
+// Whether `a == b` is settled by the values' own bits when the pair is not two finite
+// numbers (those are compared as doubles): 0 false, 1 true, 2 not settled. A nullish value
+// equals only another nullish one -- an object against null or undefined is simply not
+// equal, and `x != null` must never run x's valueOf -- two objects are equal when they are
+// the same object (no coercion happens between two objects), and two booleans compare by
+// their bits. Everything that needs a conversion (a number against a string, a boolean
+// against anything else, an object against a primitive) and the content-compared kinds are
+// apply_operator's. Mirrors its EQUAL/NOT_EQUAL cases.
+inline int loose_equal_quick(const Value& a, const Value& b) {
+    const bool a_nullish = a.is_nullish();
+    const bool b_nullish = b.is_nullish();
+    if (a_nullish || b_nullish) return a_nullish && b_nullish;
+    if ((a.is_object() || a.is_function()) && (b.is_object() || b.is_function())) {
+        return std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b);
+    }
+    if (a.is_boolean() && b.is_boolean()) return std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b);
+    return 2;
+}
+
 // `object instanceof Function` for the case the loop in OrdinaryHasInstance is the
 // whole answer: nothing anywhere has its own Symbol.hasInstance, the right side is
 // an unbound function with an object-valued prototype, and no Proxy (whose
@@ -2463,8 +2482,33 @@ NUMERIC_COMPARE_HANDLER(h_TestLt, BinOp::LESS_THAN, l < r)
 NUMERIC_COMPARE_HANDLER(h_TestGt, BinOp::GREATER_THAN, l > r)
 NUMERIC_COMPARE_HANDLER(h_TestLe, BinOp::LESS_EQUAL, l <= r)
 NUMERIC_COMPARE_HANDLER(h_TestGe, BinOp::GREATER_EQUAL, l >= r)
-NUMERIC_COMPARE_HANDLER(h_TestEq, BinOp::EQUAL, l == r)
-NUMERIC_COMPARE_HANDLER(h_TestNe, BinOp::NOT_EQUAL, l != r)
+// == and != : two finite numbers compare as doubles; otherwise the values' bits settle
+// the common cases (loose_equal_quick) and only a conversion reaches apply_operator.
+#define LOOSE_EQUALITY_HANDLER(name, binop, want_equal)                    \
+    Value name##_slow(Frame& f, uint32_t pc, Value acc) {                  \
+        const BytecodeChunk& chunk = f.chunk;                              \
+        Context& ctx = *f.ctx;                                              \
+        uint32_t& instr_pc = f.instr_pc;                                   \
+        instr_pc = pc;                                                     \
+        acc = binary_slow(ctx, binop, f.regs[f.code[pc + 1]], acc);        \
+        pc += 2;                                                           \
+        CHECK_EXC_TAIL();                                                  \
+        DISPATCH();                                                        \
+    }                                                                      \
+    Value name(Frame& f, uint32_t pc, Value acc) {                         \
+        const Value& lhs = f.regs[f.code[pc + 1]];                         \
+        if (LIKELY(lhs.is_finite_double() && acc.is_finite_double())) {    \
+            const bool equal = lhs.as_finite_double() == acc.as_finite_double(); \
+            BRANCH_AFTER_COMPARE(equal == (want_equal));                   \
+        }                                                                  \
+        const int q = loose_equal_quick(lhs, acc);                         \
+        if (q != 2) {                                                      \
+            BRANCH_AFTER_COMPARE((q == 1) == (want_equal));                \
+        }                                                                  \
+        [[clang::musttail]] return name##_slow(f, pc, acc);                \
+    }
+LOOSE_EQUALITY_HANDLER(h_TestEq, BinOp::EQUAL, true)
+LOOSE_EQUALITY_HANDLER(h_TestNe, BinOp::NOT_EQUAL, false)
 // The strict comparisons settle most non-numeric operands without a frame: the
 // values' own bits decide (see strict_equal_quick), so only two strings, BigInts or
 // symbols reach the slow half. The macro's handler would have gone there for every
