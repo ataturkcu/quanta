@@ -110,6 +110,12 @@ Value run(const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
           const Value* initial_acc = nullptr, const CallInfo* call_info = nullptr,
           Environment** final_lexical_env = nullptr);
 
+// run() for the call Function::call_gated makes to a register-mode function: it has an
+// owner, a CallInfo and a `this`, no initial accumulator and no final-environment
+// report, and with all of those decided at compile time it is the cheapest way in.
+Value run_register_call(const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
+                        const Value* this_val, Function* owner, const CallInfo* call_info);
+
 // Compiles a generator/async BODY for the suspendable calling convention
 // (bindings already live in ctx; yield/await suspend the fiber from inside
 // the dispatch loop). Null means the body doesn't compile -- caller

@@ -690,8 +690,7 @@ Value Function::call_gated(Context& ctx, std::span<const Value> args, Value this
     // scope on that chain, not just the innermost).
     Context* prev_context = Object::current_context_;
     Object::current_context_ = &ctx;
-    Value vm_result = VM::run(*executable_->bytecode_chunk, ctx, args, &fast_this, this,
-                               nullptr, &call_info);
+    Value vm_result = VM::run_register_call(*executable_->bytecode_chunk, ctx, args, &fast_this, this, &call_info);
     Object::current_context_ = prev_context;
     // Only reachable at all when this call ran Op::SuperCall, which the
     // parser accepts nowhere but a derived constructor's own body or an

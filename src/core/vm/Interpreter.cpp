@@ -40,12 +40,20 @@
 #include <emmintrin.h>
 #endif
 #include <optional>
+#include <variant>
 
 #ifndef LIKELY
 #ifdef __GNUC__
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #else
 #define LIKELY(x) (x)
+#endif
+#endif
+#ifndef UNLIKELY
+#ifdef __GNUC__
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define UNLIKELY(x) (x)
 #endif
 #endif
 
@@ -104,24 +112,44 @@ namespace {
 
 using BinOp = BinaryExpression::Operator;
 
+// Operands are stored little-endian, one byte after another. On a little-endian host a
+// two- or four-byte operand is then just a load: assembled a byte at a time (shift, or,
+// sign-extend) it was five instructions for what is one, on every operand of every
+// instruction that has a name, a feedback slot or a jump offset. memcpy is the
+// alignment-safe way to say "load these bytes"; it compiles to a plain mov.
 inline int16_t read_i16(const uint8_t* code, uint32_t pc) {
-    uint16_t raw = static_cast<uint16_t>(code[pc]) |
-                   (static_cast<uint16_t>(code[pc + 1]) << 8);
-    return static_cast<int16_t>(raw);
+    if constexpr (std::endian::native == std::endian::little) {
+        int16_t v;
+        std::memcpy(&v, code + pc, sizeof v);
+        return v;
+    } else {
+        uint16_t raw = static_cast<uint16_t>(code[pc]) | (static_cast<uint16_t>(code[pc + 1]) << 8);
+        return static_cast<int16_t>(raw);
+    }
 }
 
 inline uint16_t read_u16(const uint8_t* code, uint32_t pc) {
-    return static_cast<uint16_t>(code[pc]) |
-           (static_cast<uint16_t>(code[pc + 1]) << 8);
+    if constexpr (std::endian::native == std::endian::little) {
+        uint16_t v;
+        std::memcpy(&v, code + pc, sizeof v);
+        return v;
+    } else {
+        return static_cast<uint16_t>(code[pc]) | (static_cast<uint16_t>(code[pc + 1]) << 8);
+    }
 }
 
-// For the *Wide feedback-slot opcodes' u32 index operand -- same idea as
-// read_u16, widened. h_LdaConstWide hand-rolled this once for its own u32
-// constant-pool index; with ten more handlers needing the identical
-// unpack, a shared helper is the right call now.
+// For the *Wide feedback-slot opcodes' u32 index operand -- same idea as read_u16,
+// widened. h_LdaConstWide hand-rolled this once for its own u32 constant-pool index;
+// with ten more handlers needing the identical unpack, a shared helper is the right call.
 inline uint32_t read_u32(const uint8_t* code, uint32_t pc) {
-    return static_cast<uint32_t>(code[pc]) | (static_cast<uint32_t>(code[pc + 1]) << 8) |
-           (static_cast<uint32_t>(code[pc + 2]) << 16) | (static_cast<uint32_t>(code[pc + 3]) << 24);
+    if constexpr (std::endian::native == std::endian::little) {
+        uint32_t v;
+        std::memcpy(&v, code + pc, sizeof v);
+        return v;
+    } else {
+        return static_cast<uint32_t>(code[pc]) | (static_cast<uint32_t>(code[pc + 1]) << 8) |
+               (static_cast<uint32_t>(code[pc + 2]) << 16) | (static_cast<uint32_t>(code[pc + 3]) << 24);
+    }
 }
 
 // Whether `a === b` is settled by the values' own bits: 0 false, 1 true, 2 not
@@ -2129,13 +2157,26 @@ Value h_Return(Frame& f, uint32_t pc, Value acc) {
     return acc;
 }
 
+// What a backward jump owes that a forward one does not: the collector's safepoint and
+// the baseline JIT's offer to take the loop over. Both are rare and both are calls, and
+// a call anywhere in a function makes the compiler save callee-saved registers on the
+// way in -- three pushes and three pops, paid by every jump of every loop to guard a
+// path almost none of them take. So the hot handlers below only test whether either is
+// due and, if so, tail-call this, which owns the frame.
+[[gnu::noinline]] Value h_BackEdgeDue(Frame& f, uint32_t pc, Value acc) {
+    Collector::safepoint();
+    if (f.osr_budget < 0 && osr_try(f, pc, acc)) return f.acc;
+    DISPATCH();
+}
+
+// Counts one back edge and says whether the slow half has anything to do. The two tests
+// are combined with a non-short-circuit | so the budget is charged exactly once.
+#define BACK_EDGE_DUE() (Collector::safepoint_armed() | (--f.osr_budget < 0))
+
 Value h_Jump(Frame& f, uint32_t pc, Value acc) {
     int16_t off = read_i16(f.code, pc + 1);
     pc += 3 + off;
-    if (off < 0) {
-        Collector::safepoint();
-        if (__builtin_expect(--f.osr_budget < 0, 0) && osr_try(f, pc, acc)) return f.acc;
-    }
+    if (off < 0 && UNLIKELY(BACK_EDGE_DUE())) [[clang::musttail]] return h_BackEdgeDue(f, pc, acc);
     DISPATCH();
 }
 
@@ -2188,10 +2229,7 @@ Value h_JumpIf(Frame& f, uint32_t pc, Value acc) {
         pc += 3;
         if (truthy == JumpWhen) {
             pc += off;
-            if (off < 0) {
-                Collector::safepoint();
-                if (__builtin_expect(--f.osr_budget < 0, 0) && osr_try(f, pc, acc)) return f.acc;
-            }
+            if (off < 0 && UNLIKELY(BACK_EDGE_DUE())) [[clang::musttail]] return h_BackEdgeDue(f, pc, acc);
         }
         DISPATCH();
     }
@@ -2408,6 +2446,18 @@ STRICT_EQUALITY_HANDLER(h_TestStrictNe, BinOp::STRICT_NOT_EQUAL, false)
 // Two finite doubles is the gate, one test each; NaN, an infinity, a string, a
 // BigInt or an object with valueOf takes the slow half, which reaches
 // binary_slow directly.
+// ToInt32 of a double a cast can answer exactly: truncating toward zero into an int64
+// and keeping the low 32 bits IS the specification's modulo-2^32 for every magnitude
+// below 2^63, which covers the hash-style `x | 0` and `x >>> 0` on values well past
+// 2^31 as well as the plain int32 case. Only an operand beyond that (or infinite) takes
+// js_to_int32, whose fmod is a call -- and a call in the same function is what made
+// every bitwise handler open with five pushes it almost never used.
+inline bool to_int32_by_cast(double d, int32_t& out) {
+    if (!(d > -9.2e18 && d < 9.2e18)) return false;
+    out = static_cast<int32_t>(static_cast<int64_t>(d));
+    return true;
+}
+
 #define BITWISE_BINARY_HANDLER(name, binop, expr)                          \
     Value name##_slow(Frame& f, uint32_t pc, Value acc) {                  \
         const BytecodeChunk& chunk = f.chunk;                              \
@@ -2421,10 +2471,10 @@ STRICT_EQUALITY_HANDLER(h_TestStrictNe, BinOp::STRICT_NOT_EQUAL, false)
     }                                                                      \
     Value name(Frame& f, uint32_t pc, Value acc) {                         \
         const Value& lhs = f.regs[f.code[pc + 1]];                         \
-        if (LIKELY(lhs.is_finite_double() && acc.is_finite_double())) {    \
-            int32_t l = js_to_int32(lhs.as_finite_double());               \
-            int32_t r = js_to_int32(acc.as_finite_double());               \
-            (void)l; (void)r;                                              \
+        int32_t l, r;                                                      \
+        if (LIKELY(lhs.is_finite_double() && acc.is_finite_double() &&     \
+                   to_int32_by_cast(lhs.as_finite_double(), l) &&          \
+                   to_int32_by_cast(acc.as_finite_double(), r))) {         \
             acc = (expr);                                                  \
             pc += 2;                                                       \
             DISPATCH();                                                    \
@@ -7112,6 +7162,53 @@ Value h_SetNamedWide(Frame& f, uint32_t pc, Value acc) {
 // set needs to hear about.
 Value h_SetNamedRest(Frame& f, uint32_t pc, Value acc);
 
+// Whether storing `value` into an object can create an old-to-young edge the
+// collector has to be told about (see write_barrier_for). A number, boolean,
+// undefined or null cannot.
+inline bool store_needs_barrier(const Value& value) {
+    return !(value.is_number() || value.is_boolean() || value.is_undefined() || value.is_null());
+}
+
+// The half of a named store that has to call the collector. Reached by tail call after
+// the value is already in its slot -- the order does not matter to the collector, which
+// is told which object changed and cannot run between the two -- so that h_SetNamedFast,
+// which stores numbers and booleans most of the time, keeps the call out of its own body
+// and with it the seven pushes and pops a call used to cost every store.
+[[gnu::noinline]] Value h_SetNamedBarrier(Frame& f, uint32_t pc, Value acc) {
+    Collector::write_barrier(f.regs[f.code[pc + 1]].as_object());
+    pc += 6;
+    DISPATCH();
+}
+
+// A store that adds a property the site has seen added before: the shape changes and the
+// object gets one more slot, which is a call.
+[[gnu::noinline]] Value h_SetNamedTransition(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& receiver = f.regs[code[pc + 1]];
+    Object* obj = receiver.as_object();
+    const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
+    // transitions[0] only -- the entry the sole-shape monomorphic case always hits;
+    // te.from_shape's own null-ness (not fb.transition_count) is the guard, since an
+    // unlearned slot must never be trusted even when obj->get_shape() itself happens to
+    // be null (dictionary mode) and proto_epoch is still its initial 0.
+    if (LIKELY(!fb.transition_mega && fb.transition_count != 0)) {
+        const FeedbackSlot::TransitionEntry& te = fb.transitions[0];
+        if (te.from_shape && te.from_shape == obj->get_shape() &&
+            te.prototype == obj->get_prototype_raw() &&
+            te.proto_epoch == Object::proto_epoch() &&
+            obj->is_extensible()) {
+            const std::string& name = f.chunk.name_at(read_u16(code, pc + 2));
+            if (!obj->has_descriptor_override(name)) {
+                write_barrier_for(obj, acc);
+                obj->add_shape_property_cached(name, acc, te.to_shape);
+                pc += 6;
+                DISPATCH();
+            }
+        }
+    }
+    [[clang::musttail]] return h_SetNamedRest(f, pc, acc);
+}
+
 Value h_SetNamedFast(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
     const Value& receiver = f.regs[code[pc + 1]];
@@ -7128,33 +7225,15 @@ Value h_SetNamedFast(Frame& f, uint32_t pc, Value acc) {
                        e.shape == obj->get_shape() &&
                        !obj->has_any_descriptor_override())) {
                 if (Value* slot = obj->get_shape_slot_unchecked(e.slot_index)) {
-                    write_barrier_for(obj, acc);
                     *slot = acc;
+                    if (store_needs_barrier(acc)) [[clang::musttail]] return h_SetNamedBarrier(f, pc, acc);
                     pc += 6;
                     DISPATCH();
                 }
             }
-            // New-property transition cache: mirrors set_named's own transition block
-            // (see its comment) for the case this store is not an overwrite but adding
-            // a brand-new own property. transitions[0] only -- the entry the sole-shape
-            // monomorphic case always hits; te.from_shape's own null-ness (not
-            // fb.transition_count) is the guard, since an unlearned slot must never be
-            // trusted even when obj->get_shape() itself happens to be null (dictionary
-            // mode) and proto_epoch is still its initial 0.
+            // New-property transition cache: see h_SetNamedTransition.
             if (LIKELY(!fb.transition_mega && fb.transition_count != 0)) {
-                const FeedbackSlot::TransitionEntry& te = fb.transitions[0];
-                if (te.from_shape && te.from_shape == obj->get_shape() &&
-                    te.prototype == obj->get_prototype_raw() &&
-                    te.proto_epoch == Object::proto_epoch() &&
-                    obj->is_extensible()) {
-                    const std::string& name = f.chunk.name_at(read_u16(code, pc + 2));
-                    if (!obj->has_descriptor_override(name)) {
-                        write_barrier_for(obj, acc);
-                        obj->add_shape_property_cached(name, acc, te.to_shape);
-                        pc += 6;
-                        DISPATCH();
-                    }
-                }
+                [[clang::musttail]] return h_SetNamedTransition(f, pc, acc);
             }
         }
     }
@@ -7228,16 +7307,11 @@ Value h_GetKeyedFast(Frame& f, uint32_t pc, Value acc) {
                 pc += 4;
                 DISPATCH();
             }
-            if (obj->get_type() == Object::ObjectType::TypedArray) {
-                double element;
-                if (static_cast<TypedArrayBase*>(obj)->read_plain_number(index, element)) {
-                    acc = Value(element);
-                    pc += 4;
-                    DISPATCH();
-                }
-            }
         }
     }
+    // A typed array's read is a call (read_plain_number), and a call anywhere in this
+    // function would have it open with five pushes for the dense-array load that is
+    // nearly every execution of it. h_GetKeyedElement handles the typed array just as well.
     [[clang::musttail]] return h_GetKeyedElement(f, pc, acc);
 }
 
@@ -8982,8 +9056,39 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     return run_dispatch(f);
 }
 
+// Sets the first `used` registers of a 32-register bank to undefined, four at a time (the
+// bank is 256 bytes, so rounding up to a multiple of four never leaves it). The loop it
+// replaces indexed each pair from a counter -- shift, shift, store, add, extend,
+// compare, branch -- eight instructions per two registers; walking a pointer is four
+// per four.
+[[gnu::always_inline]] inline void init_register_bank(unsigned char* bank, unsigned used) {
+    if (used == 0) return;
+    const uint64_t undef_bits = std::bit_cast<uint64_t>(Value());
+#if defined(__SSE2__)
+    const __m128i pair = _mm_set1_epi64x(static_cast<long long>(undef_bits));
+    __m128i* p = reinterpret_cast<__m128i*>(bank);
+    __m128i* const end = p + ((used + 3) >> 2) * 2;
+    do {
+        _mm_store_si128(p, pair);
+        _mm_store_si128(p + 1, pair);
+        p += 2;
+    } while (p < end);
+#else
+    for (unsigned i = 0; i < used; i++) std::memcpy(bank + i * sizeof(Value), &undef_bits, sizeof undef_bits);
+#endif
+}
+
 // What run() does once its register bank exists, whichever kind that is. Always
-// inlined into both callers below so the hot one carries no extra call.
+// inlined into the callers below so the hot one carries no extra call.
+//
+// `Fast` is the call a register-mode function gets from Function::call_gated: it has a
+// CallInfo, an owner and a `this`, no initial accumulator, nowhere to report a final
+// environment, and no environment of its own (that is what the register-mode gate
+// means). Each of those is a runtime test in the general form -- the parameter binding
+// block, the final-environment writer, the two environment roots, the ternaries for
+// the accumulator, `this` and rootedness -- and about forty instructions of the
+// ~200 a call spent here; as a template argument they are decided by the compiler.
+template <bool Fast>
 [[gnu::always_inline]] inline Value run_with_regs(
         const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
         const Value* this_val, Function* owner, const Value* initial_acc,
@@ -9006,8 +9111,8 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     // ctx.get_lexical_environment() at each point below (push_block_scope_into
     // re-reads it back after calling ctx's own push_block_scope), so nothing
     // here changes for the general/env_ctx-owning path.
-    Environment* cur_lex = call_info ? call_info->lexical_environment_ : ctx.get_lexical_environment();
-    if (chunk.env_mode && chunk.env) {
+    Environment* cur_lex = (Fast || call_info) ? call_info->lexical_environment_ : ctx.get_lexical_environment();
+    if (!Fast && chunk.env_mode && chunk.env) {
         Environment* env = cur_lex;
         // Intern the chunk's binding names once instead of once per call; the
         // pointers are stable for the thread's lifetime.
@@ -9076,7 +9181,7 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     // from the right place. cur_lex already reflects the prologue's own
     // lex_scope_split push above, same as re-reading ctx used to.
     Environment* entry_env = cur_lex;
-    Environment* entry_var_env = call_info ? call_info->variable_environment_ : ctx.get_variable_environment();
+    Environment* entry_var_env = (Fast || call_info) ? call_info->variable_environment_ : ctx.get_variable_environment();
 
     // A chunk may be shared across several Function instances created from the
     // same declaration site (see FunctionExecutable), each with its own
@@ -9124,8 +9229,8 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     // (even in a derived constructor -- super() sets it once), so resolve
     // the binding at most once. Whether a read is ALLOWED yet is a separate,
     // per-read check (this-TDZ, see the opcode below).
-    bool this_resolved = this_val != nullptr;
-    Value this_value = this_val ? *this_val : Value();
+    bool this_resolved = Fast || this_val != nullptr;
+    Value this_value = (Fast || this_val) ? *this_val : Value();
 
     const uint8_t* code = chunk.code.data();
     const Value* constants = chunk.constants.data();
@@ -9138,11 +9243,11 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     // compile_script is reached from run_script alone, and that is where the
     // chunk gets its root -- so script_mode is exactly "this chunk's caches
     // are traced".
-    const bool feedback_rooted = owner != nullptr || chunk.script_mode;
+    const bool feedback_rooted = Fast || owner != nullptr || chunk.script_mode;
     Frame frame{chunk, &ctx, args, owner, feedback_rooted, regs, env_saves, resolved_envs,
                 lookup_cache_data,
                 private_feedback_data, code, constants, entry_env,
-                this_value, initial_acc ? *initial_acc : Value(), 0, 0, 0, this_resolved};
+                this_value, (!Fast && initial_acc) ? *initial_acc : Value(), 0, 0, 0, this_resolved};
     FrameLinkScope frame_link(&chunk, &frame.instr_pc, owner);
     frame.call_info = call_info;
     // Seeded even when call_info is null (frame_lexical_env/frame_variable_env
@@ -9157,7 +9262,7 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     struct FinalEnvWriter {
         Frame* f; Environment** out;
         ~FinalEnvWriter() { if (out) *out = f->current_lexical_env; }
-    } final_env_writer{&frame, final_lexical_env};
+    } final_env_writer{&frame, Fast ? nullptr : final_lexical_env};
     // call_info means ctx is the caller's own shared Context, so ctx's own
     // gc_trace (lexical_environment_/variable_environment_) never reaches
     // whatever this call is actually using -- these two fields are the only
@@ -9177,10 +9282,15 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     // this on chunk.env_mode too turns a per-call cost that fast_gate -- by
     // far the larger of the two call_info-bearing buckets -- was paying for
     // nothing into a cost only fast_no_closures (which actually needs it) pays.
-    std::optional<EnvironmentRoot> lex_root, var_root;
-    if (call_info && chunk.env_mode) {
-        lex_root.emplace(&frame.current_lexical_env);
-        var_root.emplace(&frame.current_variable_env);
+    // Not even declared in the register-mode form: an unengaged optional is still a flag
+    // to clear on entry and test on every exit, twice.
+    struct EnvRoots { std::optional<EnvironmentRoot> lex, var; };
+    std::conditional_t<Fast, std::monostate, EnvRoots> env_roots;
+    if constexpr (!Fast) {
+        if (call_info && chunk.env_mode) {
+            env_roots.lex.emplace(&frame.current_lexical_env);
+            env_roots.var.emplace(&frame.current_variable_env);
+        }
     }
 
     if (__builtin_expect(chunk.jit_state != 1, 0) && chunk.jit_state != 2) jit::consider(chunk);
@@ -9256,8 +9366,8 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
         ~SpillRoot() { Collector::pop_value_vector(v); }
     } spill_root{&spill_regs};
     Collector::push_value_vector(&spill_regs);
-    return run_with_regs(chunk, ctx, args, this_val, owner, initial_acc, call_info,
-                         spill_regs.data(), final_lexical_env);
+    return run_with_regs<false>(chunk, ctx, args, this_val, owner, initial_acc, call_info,
+                                spill_regs.data(), final_lexical_env);
 }
 
 constinit thread_local FrameLink* g_frame_links = nullptr;
@@ -9287,23 +9397,26 @@ Value run(const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
     // the only cost of leaving it is a possible false retention.
     alignas(Value) unsigned char bank[kInlineRegs * sizeof(Value)];
     Value* inline_regs = reinterpret_cast<Value*>(bank);
-    {
-        const uint64_t undef_bits = std::bit_cast<uint64_t>(Value());
-        // Parameters are copied into the first slots whether or not the chunk's
-        // own count says it needs them.
-        const uint16_t used = std::max<uint16_t>(chunk.register_count, chunk.parameter_count);
-#if defined(__SSE2__)
-        const __m128i pair = _mm_set1_epi64x(static_cast<long long>(undef_bits));
-        for (uint16_t i = 0; i < used; i += 2) {
-            _mm_store_si128(reinterpret_cast<__m128i*>(bank) + i / 2, pair);
-        }
-#else
-        for (uint16_t i = 0; i < used; i++) {
-            std::memcpy(bank + i * sizeof(Value), &undef_bits, sizeof undef_bits);
-        }
-#endif
+    // Parameters are copied into the first slots whether or not the chunk's own count
+    // says it needs them.
+    init_register_bank(bank, std::max<unsigned>(chunk.register_count, chunk.parameter_count));
+    return run_with_regs<false>(chunk, ctx, args, this_val, owner, initial_acc, call_info, inline_regs, final_lexical_env);
+}
+
+// run() for a call from Function::call_gated: a register-mode function with an owner, a
+// CallInfo and a `this`. See run_with_regs. A chunk that unexpectedly has an
+// environment, or too many registers for the inline bank, takes the general entry, so
+// the specialization can only ever be skipped, never wrong.
+Value run_register_call(const BytecodeChunk& chunk, Context& ctx, std::span<const Value> args,
+                        const Value* this_val, Function* owner, const CallInfo* call_info) {
+    constexpr uint16_t kInlineRegs = 32;
+    if (__builtin_expect(chunk.env_mode || chunk.register_count > kInlineRegs, 0)) {
+        return run(chunk, ctx, args, this_val, owner, nullptr, call_info, nullptr);
     }
-    return run_with_regs(chunk, ctx, args, this_val, owner, initial_acc, call_info, inline_regs, final_lexical_env);
+    alignas(Value) unsigned char bank[kInlineRegs * sizeof(Value)];
+    Value* inline_regs = reinterpret_cast<Value*>(bank);
+    init_register_bank(bank, std::max<unsigned>(chunk.register_count, chunk.parameter_count));
+    return run_with_regs<true>(chunk, ctx, args, this_val, owner, nullptr, call_info, inline_regs, nullptr);
 }
 
 Value run_script(std::vector<std::unique_ptr<ASTNode>>& statements,
