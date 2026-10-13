@@ -255,9 +255,10 @@ public:
     }
     [[nodiscard]] inline bool is_undefined() const noexcept { return has_tag_(TAG_UNDEFINED); }
     [[nodiscard]] inline bool is_null() const noexcept { return has_tag_(TAG_NULL); }
+    // False and true are adjacent tags (2 and 3), so one compare after clearing
+    // the low bit of the top sixteen answers for both.
     [[nodiscard]] inline bool is_boolean() const noexcept {
-        return has_tag_(TAG_FALSE) ||
-               has_tag_(TAG_TRUE);
+        return ((bits_ >> 48) & ~uint64_t{1}) == ((QUIET_NAN | TAG_FALSE) >> 48);
     }
     [[nodiscard]] inline bool is_number() const noexcept {
         return (bits_ & EXPONENT_MASK) != EXPONENT_MASK ||
@@ -279,7 +280,8 @@ public:
     inline bool is_primitive() const { 
         return is_undefined() || is_null() || is_boolean() || is_number() || is_string() || is_symbol() || is_bigint();
     }
-    inline bool is_nullish() const { return is_undefined() || is_null(); }
+    // Undefined and null are adjacent tags (0 and 1): one compare, as for booleans.
+    inline bool is_nullish() const { return ((bits_ >> 48) & ~uint64_t{1}) == (QUIET_NAN >> 48); }
     inline bool is_numeric() const { return is_number() || is_bigint(); }
     
     inline bool is_object_like() const { return is_object() || is_function(); }

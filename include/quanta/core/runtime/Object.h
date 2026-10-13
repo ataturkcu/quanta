@@ -688,7 +688,7 @@ public:
             materialize_regexp_last_index();
         }
     }
-    bool is_extensible() const;
+    bool is_extensible() const { return !proto_.flag(kNotExtensible); }
     void prevent_extensions();
     void reopen_extensible();
     void seal();
@@ -2064,6 +2064,8 @@ public:
     // call_register_args states: already GC roots, and valid for the whole call.
     Value construct(Context& ctx, std::span<const Value> args);
     void learn_construct_slot_hint(const Object* built);
+    bool construct_plain(Context& ctx, std::span<const Value> args, Value& out);
+    bool new_target_is_self_or_none(const Context& ctx) const;
     // For a caller that arrived with a vector: its storage is malloc'd and
     // invisible to the stack scan, so it is rooted for the duration.
     Value construct(Context& ctx, const std::vector<Value>& args);
@@ -2171,6 +2173,19 @@ inline Function* as_function(Object* obj) {
 }
 inline const Function* as_function(const Object* obj) {
     return (obj && obj->get_type() == Object::ObjectType::Function) ? static_cast<const Function*>(obj) : nullptr;
+}
+
+// Value(Object*) lives here rather than in Value.cpp so it can be inlined: it is
+// a handful of instructions (a null test and the object's type bits) and sat
+// behind a call at every site that wrapped an object, which is every allocation
+// and every property read that returned one.
+inline Value::Value(Object* obj) {
+    if (!obj) {
+        bits_ = QUIET_NAN | TAG_UNDEFINED;
+        return;
+    }
+    const uint64_t masked_value = reinterpret_cast<uint64_t>(obj) & PAYLOAD_MASK;
+    bits_ = QUIET_NAN | (obj->is_function() ? TAG_FUNCTION : TAG_OBJECT) | masked_value;
 }
 
 namespace ObjectFactory {

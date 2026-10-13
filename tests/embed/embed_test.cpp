@@ -120,7 +120,11 @@ __attribute__((noinline)) static void give_young_child(Holder* holder) {
 
 static void test_write_barrier_covers_old_to_young_edge(Runtime& rt) {
     Context& ctx = rt.GetContext();
-    Holder* holder = make_old_holder(ctx, rt);
+    // volatile: the store of nullptr below must really happen. As a plain local
+    // it is a dead store, and the pointer then lingers in whichever register or
+    // stack slot the compiler chose, where the conservative scan finds it and
+    // keeps the holder alive -- which made this check depend on code layout.
+    Holder* volatile holder = make_old_holder(ctx, rt);
     give_young_child(holder);
     scrub_stack();
     Collector::collect_minor();

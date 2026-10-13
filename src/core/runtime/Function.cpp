@@ -2048,6 +2048,100 @@ bool Function::super_call_reads_new_target() const {
     return super && super->is_native() && super->takes_new_target();
 }
 
+namespace {
+// These flags live on the shared Context, so a `new` evaluated inside a
+// constructor body clears the ones belonging to the frame that is still
+// running: `new Map()` after `super()` left the enclosing derived
+// constructor looking like it had never called super at all. new.target
+// is saved for the same reason by the constructors; these five are its
+// neighbours.
+struct ConstructFlagsGuard {
+    Context& ctx;
+    bool super_called;
+    bool in_constructor_call;
+    Object* super_override;
+    bool super_override_needs_reparent;
+    bool construct_explicit_return;
+    explicit ConstructFlagsGuard(Context& c)
+        : ctx(c), super_called(c.was_super_called()), in_constructor_call(c.is_in_constructor_call()),
+          super_override(c.last_super_override()),
+          super_override_needs_reparent(c.last_super_override_needs_reparent()),
+          construct_explicit_return(c.last_construct_explicit_return()) {}
+    ~ConstructFlagsGuard() {
+        ctx.set_super_called(super_called);
+        ctx.set_in_constructor_call(in_constructor_call);
+        ctx.set_last_super_override(super_override);
+        ctx.set_last_super_override_needs_reparent(super_override_needs_reparent);
+        ctx.set_last_construct_explicit_return(construct_explicit_return);
+    }
+};
+}
+
+// `new F(...)` for the commonest F: a base constructor (a plain function or a
+// class with no superclass) that is not a default constructor, called with no
+// new.target in flight. The general construct() below resolves a prototype
+// through new.target, has a branch for every shape of derived class and
+// auto-super, and swaps results back and forth; none of which can happen
+// here, and the straight line it leaves is a third of the instructions.
+// Anything that would take another road -- a prototype that is not an object,
+// an exception before the body runs -- is either decided before a single
+// side effect (returns false) or ends exactly as the general form does.
+bool Function::new_target_is_self_or_none(const Context& ctx) const {
+    const Value& nt = ctx.get_new_target();
+    return nt.is_undefined() || (nt.is_function() && nt.as_function() == this);
+}
+
+bool Function::construct_plain(Context& ctx, std::span<const Value> args, Value& out) {
+    const Value proto_value = constructor_prototype();
+    Object* pending_proto = proto_value.is_function() ? static_cast<Object*>(proto_value.as_function())
+                          : proto_value.is_object()   ? proto_value.as_object() : nullptr;
+    if (!pending_proto) return false;
+
+    // See the general construct() for what the hint is.
+    const uint32_t construct_slot_hint = get_construct_slot_hint();
+    std::unique_ptr<Object> new_object;
+    if (construct_slot_hint <= 4) {
+        new_object = ObjectFactory::create_object_with_slots((construct_slot_hint + 1) & ~1u);
+    } else {
+        new_object = ObjectFactory::create_object();
+        new_object->reserve_property_slots(construct_slot_hint);
+    }
+    new_object->initialize_prototype_of_new(pending_proto);
+    const Value this_value(new_object.get());
+
+    initialize_base_instance(ctx, new_object.get());
+    if (ctx.has_exception()) { out = Value(); return true; }
+
+    ConstructFlagsGuard construct_flags_guard(ctx);
+    ctx.set_in_constructor_call(true);
+    ctx.set_super_called(false);
+    const Value old_new_target = ctx.get_new_target();
+    if (old_new_target.is_undefined()) ctx.set_new_target(Value(static_cast<Object*>(this)));
+    ctx.set_last_super_override(nullptr);
+    ctx.set_last_super_override_needs_reparent(false);
+    ctx.set_pending_construct_call(true);
+    const Value result = call_register_args(ctx, args, this_value);
+    ctx.set_in_constructor_call(false);
+    ctx.set_new_target(old_new_target);
+
+    if (ctx.has_exception()) { out = Value(); return true; }
+
+    const bool explicit_return = result.is_object() || result.is_function();
+    if (explicit_return && result.as_object() != new_object.get()) {
+        // An explicit `return obj` is used as it is; the prototype fix-up is
+        // for an object that came back with none (see construct()).
+        Object* ret_obj = result.as_object();
+        if (!ret_obj->get_prototype_raw()) ret_obj->set_prototype(pending_proto);
+        ctx.set_last_construct_explicit_return(!is_native());
+        new_object.release();
+        out = result;
+        return true;
+    }
+    learn_construct_slot_hint(new_object.get());
+    out = Value(new_object.release());
+    return true;
+}
+
 Value Function::construct(Context& ctx, const std::vector<Value>& args) {
     ValueVectorRoot args_root(&args);
     return construct(ctx, std::span<const Value>(args));
@@ -2058,6 +2152,15 @@ Value Function::construct(Context& ctx, std::span<const Value> args) {
     if (!is_constructor_) {
         ctx.throw_exception(Value("TypeError: " + get_name() + " is not a constructor"));
         return Value();
+    }
+    // new.target is this function already when the `new` came from the VM, which
+    // names the callee there before it calls in; undefined from native callers.
+    // Anything else is a Reflect.construct or a super() chain with its own.
+    if (LIKELY_NATIVE(!is_native_ && executable_ && executable_->fast_gate &&
+                      get_function_kind() == FunctionKind::Plain && !is_derived_ctor() &&
+                      !is_default_ctor() && new_target_is_self_or_none(ctx))) {
+        Value built;
+        if (construct_plain(ctx, args, built)) return built;
     }
 
     // The prototype is resolved before the object exists, so nothing runs
@@ -2141,28 +2244,7 @@ Value Function::construct(Context& ctx, std::span<const Value> args) {
         if (ctx.has_exception()) return Value();
     }
 
-    // These flags live on the shared Context, so a `new` evaluated inside a
-    // constructor body clears the ones belonging to the frame that is still
-    // running: `new Map()` after `super()` left the enclosing derived
-    // constructor looking like it had never called super at all. new.target
-    // below is saved for the same reason; these three are its neighbours.
-    struct ConstructFlagsGuard {
-        Context& ctx;
-        bool super_called;
-        bool in_constructor_call;
-        Object* super_override;
-        bool super_override_needs_reparent;
-        bool construct_explicit_return;
-        ~ConstructFlagsGuard() {
-            ctx.set_super_called(super_called);
-            ctx.set_in_constructor_call(in_constructor_call);
-            ctx.set_last_super_override(super_override);
-            ctx.set_last_super_override_needs_reparent(super_override_needs_reparent);
-            ctx.set_last_construct_explicit_return(construct_explicit_return);
-        }
-    } construct_flags_guard{ctx, ctx.was_super_called(), ctx.is_in_constructor_call(),
-                            ctx.last_super_override(), ctx.last_super_override_needs_reparent(),
-                            ctx.last_construct_explicit_return()};
+    ConstructFlagsGuard construct_flags_guard(ctx);
 
     ctx.set_in_constructor_call(true);
     ctx.set_super_called(false);

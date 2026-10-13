@@ -3840,10 +3840,6 @@ Object* Object::get_prototype() const {
     return proto_;
 }
 
-bool Object::is_extensible() const {
-    return !proto_.flag(kNotExtensible);
-}
-
 void Object::prevent_extensions() {
     proto_.set_flag(kNotExtensible);
 }

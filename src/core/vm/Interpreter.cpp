@@ -7305,7 +7305,10 @@ inline bool store_needs_barrier(const Value& value) {
             obj->is_extensible()) {
             const std::string& name = f.chunk.name_at(read_u16(code, pc + 2));
             if (!obj->has_descriptor_override(name)) {
-                write_barrier_for(obj, acc);
+                // A number or boolean store needs no barrier, and the barrier is a
+                // call: asking first keeps it (and the saves around it) off the
+                // path of `this.x = 0`.
+                if (store_needs_barrier(acc)) Collector::write_barrier(obj);
                 obj->add_shape_property_cached(name, acc, te.to_shape);
                 pc += 6;
                 DISPATCH();
