@@ -7,13 +7,12 @@
 #include "quanta/core/engine/HostHooks.h"
 #include "JitLayout.h"
 // The baseline JIT (Jit.inc, included further down) needs these at file scope.
-#if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
+#ifdef QUANTA_JIT_PLATFORM_OK
 #include "X64Asm.h"
 #include <deque>
 #include <functional>
 #include <unordered_map>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "JitPlatform.h"
 #endif
 #include <array>
 #include "quanta/core/vm/Interpreter.h"

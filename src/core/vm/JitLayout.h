@@ -21,6 +21,29 @@
 #include <exception>
 #include <vector>
 
+// Targets the baseline JIT can run on: it emits x86-64 only, and has a way to get
+// executable memory (JitPlatform.h) on Linux, macOS and Windows. Anywhere else every
+// function stays with the interpreter.
+#if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__) || defined(_WIN32))
+#define QUANTA_JIT_PLATFORM_OK 1
+#endif
+
+// Which x86-64 calling convention generated code uses to reach the C++ helpers and
+// to be entered. Windows uses the Microsoft one (arguments in rcx, rdx, r8, r9 with
+// 32 bytes of shadow space, rdi and rsi preserved); everything else uses System V.
+// QUANTA_JIT_FORCE_WIN64 selects the Microsoft convention on any x86-64 target by
+// declaring every function the generated code touches with clang's ms_abi
+// attribute, which is how that half of the code generator is exercised and tested
+// without a Windows machine.
+#if defined(_WIN32) || defined(QUANTA_JIT_FORCE_WIN64)
+#define QUANTA_JIT_WIN64 1
+#endif
+#if defined(QUANTA_JIT_FORCE_WIN64) && !defined(_WIN32)
+#define QUANTA_JIT_ABI __attribute__((ms_abi))
+#else
+#define QUANTA_JIT_ABI
+#endif
+
 namespace Quanta {
 
 // One inline cache owned by a JIT'd GetNamed/SetNamed site. The key is the
@@ -78,7 +101,7 @@ struct JitCode {
     size_t code_bytes = 0;
     // (Frame*, JitCode*, native address to start at) -> 0 finished (result in
     // Frame::acc), 1 rethrow `pending`, 2 continue in the interpreter at Frame::pc
-    uint64_t (*entry)(void*, JitCode*, const void*) = nullptr;
+    uint64_t (QUANTA_JIT_ABI *entry)(void*, JitCode*, const void*) = nullptr;
     // The bytecode as the interpreter runs it while stepping one instruction:
     // identical to the chunk's own, except that a stop byte is written over the
     // instruction the step must end at (see jit_step).

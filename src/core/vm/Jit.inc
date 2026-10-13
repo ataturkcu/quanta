@@ -46,7 +46,7 @@
 //   rbx Frame*   r12 register bank   r13 accumulator   r14 JitCode*
 //   r15 this code's inline caches    rbp finite-double limit (see finite_check)
 
-#if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
+#ifdef QUANTA_JIT_PLATFORM_OK
 #define QUANTA_JIT_X64 1
 #endif
 
@@ -74,6 +74,28 @@ constexpr size_t kOffCurLexEnv = offsetof(Frame, current_lexical_env);
 namespace jit {
 
 using namespace x64;
+
+// The calling convention generated code uses toward the C++ helpers (see
+// QUANTA_JIT_WIN64 in JitLayout.h). Every site that passes arguments, reserves stack
+// for a call, or enters/leaves generated code goes through these, so the two ABIs
+// differ here and nowhere else:
+//  - System V passes arguments in rdi, rsi, rdx, rcx and preserves rbx, rbp, r12-r15.
+//  - Microsoft passes them in rcx, rdx, r8, r9, wants 32 bytes of shadow space at
+//    rsp for the callee, and also preserves rdi and rsi. It has no red zone, which
+//    generated code never relied on.
+// Helpers take at most four arguments so that none of them needs a stack argument.
+namespace abi {
+#ifdef QUANTA_JIT_WIN64
+constexpr Reg A0 = RCX, A1 = RDX, A2 = R8, A3 = R9;
+constexpr int32_t kShadow = 32;                 // bytes a call needs reserved at rsp
+constexpr bool kPreservesRdiRsi = true;
+#else
+constexpr Reg A0 = RDI, A1 = RSI, A2 = RDX, A3 = RCX;
+constexpr int32_t kShadow = 0;
+constexpr bool kPreservesRdiRsi = false;
+#endif
+}  // namespace abi
+
 
 // ---------------------------------------------------------------------------
 // Value encoding. These are asserted against the real Value class once at
@@ -328,7 +350,7 @@ void learn_ic(Frame* f, JitCode* jc, uint32_t pc, uint32_t block) noexcept {
 // by an outer step: it just stops there, early, and resumes natively.
 //
 // Returns the pc to continue at, or a kStep* code.
-int32_t step_impl(Frame* f, uint32_t pc, uint32_t len, uint32_t target, uint32_t ic_index) noexcept {
+int32_t step_impl(Frame* f, uint32_t pc, uint32_t target, uint32_t ic_index) noexcept {
     JitCode* jc = f->chunk.jit.get();
     jc->slow++;
     const uint32_t size = jc->code_size;
@@ -338,6 +360,9 @@ int32_t step_impl(Frame* f, uint32_t pc, uint32_t len, uint32_t target, uint32_t
     }
 
     const uint8_t op = f->chunk.code[pc];
+    // The length the code generator decoded this instruction with. Not passed in: the
+    // Microsoft ABI has four argument registers and a fifth would go on the stack.
+    const uint32_t len = 1 + static_cast<uint32_t>(op_operand_bytes(static_cast<Op>(op)));
     const uint8_t* saved_code = f->code;
     f->jit_halted = false;
     Value result;
@@ -416,15 +441,15 @@ int32_t step_impl(Frame* f, uint32_t pc, uint32_t len, uint32_t target, uint32_t
     return kStepFinished;
 }
 
-int32_t step(Frame* f, uint32_t pc, uint32_t len, uint32_t target, uint32_t ic_index) noexcept {
+QUANTA_JIT_ABI int32_t step(Frame* f, uint32_t pc, uint32_t target, uint32_t ic_index) noexcept {
     if (__builtin_expect(g_cfg.stats, 0)) {
         const uint8_t op = f->chunk.code[pc];
         const uint64_t t0 = __builtin_ia32_rdtsc();
-        const int32_t r = step_impl(f, pc, len, target, ic_index);
+        const int32_t r = step_impl(f, pc, target, ic_index);
         g_cfg.step_cycles[op] += __builtin_ia32_rdtsc() - t0;
         return r;
     }
-    return step_impl(f, pc, len, target, ic_index);
+    return step_impl(f, pc, target, ic_index);
 }
 
 // The handler search CHECK_EXC does: the narrowest try region covering `pc`.
@@ -585,7 +610,7 @@ int fast_get_named_impl(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
     return 0;
 }
 
-int fast_get_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
+QUANTA_JIT_ABI int fast_get_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
     const int handled = fast_get_named_impl(f, pc, ic_index);
     // The interpreter has already learned this site (that is what let the helper
     // answer), so the generated code's own cache can copy it now rather than wait
@@ -633,14 +658,14 @@ int fast_set_named_impl(Frame* f, uint32_t pc) noexcept {
     return 0;
 }
 
-int fast_set_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
+QUANTA_JIT_ABI int fast_set_named(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
     const int handled = fast_set_named_impl(f, pc);
     if (handled && ic_index != kNoOperand) learn_ic(f, f->chunk.jit.get(), pc, ic_index);
     return handled;
 }
 
 // LdaLookup / LdaLookupStar: every cached form (h_LdaLookupFast).
-int fast_lookup(Frame* f, uint32_t pc) noexcept {
+QUANTA_JIT_ABI int fast_lookup(Frame* f, uint32_t pc) noexcept {
     f->chunk.jit->slow++;
     const auto& entry = f->lookup_cache_data[read_u16(f->chunk.code.data(), pc + 1)];
     if (entry.shadow_epoch != Environment::binding_shadow_epoch()) return 0;
@@ -669,7 +694,7 @@ int fast_lookup(Frame* f, uint32_t pc) noexcept {
 // The environment-slot forms (h_LdaEnvSlotFast, h_StaEnvSlotFast and their
 // hop-walking counterparts): kind 0 LdaEnvSlot, 1 StaEnvSlot, 2 LdaEnvSlotAt,
 // 3 StaEnvSlotAt.
-int fast_env_slot(Frame* f, uint32_t pc, uint32_t kind) noexcept {
+QUANTA_JIT_ABI int fast_env_slot(Frame* f, uint32_t pc, uint32_t kind) noexcept {
     const uint8_t* code = f->chunk.code.data();
     Environment* env = frame_lexical_env(*f);
     uint32_t slot, name_at;
@@ -694,7 +719,7 @@ int fast_env_slot(Frame* f, uint32_t pc, uint32_t kind) noexcept {
 
 // SetKeyed's element stores (h_SetKeyedFast / h_SetKeyedElement): an in-range or
 // appending store to a dense array, and a typed-array number store.
-int fast_set_keyed(Frame* f, uint32_t pc) noexcept {
+QUANTA_JIT_ABI int fast_set_keyed(Frame* f, uint32_t pc) noexcept {
     f->chunk.jit->slow++;
     const uint8_t* code = f->chunk.code.data();
     const Value& acc = f->acc;
@@ -716,7 +741,7 @@ int fast_set_keyed(Frame* f, uint32_t pc) noexcept {
 // The binary operators' general path (every NUMERIC_/BITWISE_BINARY_HANDLER's
 // `_slow`, and TestInstanceOf): acc = binary_slow(regs[r], acc), then the
 // exception routing. `op` is the BinaryExpression::Operator.
-int32_t binary_op(Frame* f, uint32_t pc, uint32_t op) noexcept {
+QUANTA_JIT_ABI int32_t binary_op(Frame* f, uint32_t pc, uint32_t op) noexcept {
     JitCode* jc = f->chunk.jit.get();
     jc->slow++;
     if (__builtin_expect(g_cfg.stats, 0)) { g_cfg.steps[f->chunk.code[pc]]++; g_cfg.step_total++; }
@@ -735,7 +760,7 @@ int32_t binary_op(Frame* f, uint32_t pc, uint32_t op) noexcept {
 // h_gen_CallResolved. A call is by far the most frequent thing the generated
 // code cannot do inline, and routing it through `step` would pay the stop-byte
 // machinery for an instruction that never needs it.
-int32_t call_op(Frame* f, uint32_t pc, uint32_t kind) noexcept {
+QUANTA_JIT_ABI int32_t call_op(Frame* f, uint32_t pc, uint32_t kind) noexcept {
     JitCode* jc = f->chunk.jit.get();
     if (__builtin_expect(g_cfg.stats, 0)) { g_cfg.steps[f->chunk.code[pc]]++; g_cfg.step_total++; }
     const uint8_t* code = f->chunk.code.data();
@@ -786,12 +811,12 @@ int32_t call_op(Frame* f, uint32_t pc, uint32_t kind) noexcept {
     return after_call(f, jc, pc, next);
 }
 
-void safepoint(Frame* f) noexcept {
+QUANTA_JIT_ABI void safepoint(Frame* f) noexcept {
     f->chunk.jit->rt.sp_counter = g_cfg.safepoint_reload;
     Collector::safepoint();
 }
 
-void write_barrier(Object* obj) noexcept { Collector::write_barrier(obj); }
+QUANTA_JIT_ABI void write_barrier(Object* obj) noexcept { Collector::write_barrier(obj); }
 
 // ---------------------------------------------------------------------------
 // The compiler.
@@ -884,7 +909,7 @@ struct StubSet {
 // counters (thread-local in Object) so that a check is one load, not a TLS lookup.
 thread_local StubSet t_stubs;
 
-void write_barrier(Object* obj) noexcept;
+QUANTA_JIT_ABI void write_barrier(Object* obj) noexcept;
 
 bool alloc_exec(const std::vector<uint8_t>& bytes, void*& mem, size_t& size, uint8_t*& start);
 
@@ -1020,9 +1045,11 @@ bool build_stubs() {
         // caller's rsp is 16-aligned, the stub's return address makes it 8 off, and
         // five pushes put it back.
         a.push(RAX); a.push(RSI); a.push(RDI); a.push(RDX); a.push(RAX);
-        a.mov(RDI, RAX);
+        a.mov(abi::A0, RAX);
         a.mov_store(mem(RBX, kOffAcc), R13);                      // keep the value visible to the collector
+        if (abi::kShadow) a.sub_imm(RSP, abi::kShadow);           // a multiple of 16: alignment holds
         a.call_abs(reinterpret_cast<const void*>(&write_barrier));
+        if (abi::kShadow) a.add_imm(RSP, abi::kShadow);
         a.pop(RAX); a.pop(RDX); a.pop(RDI); a.pop(RSI); a.pop(RAX);
         a.bind(no_barrier);
         a.mov_store(mem_idx(RSI, RDI, 8), R13);
@@ -1280,16 +1307,20 @@ bool Compiler::decode() {
 }
 
 void Compiler::emit_prologue() {
-    // uint64_t entry(Frame* rdi, JitCode* rsi, const void* rdx)
+    // uint64_t entry(Frame* a0, JitCode* a1, const void* a2)
     a_.push(RBP); a_.push(RBX); a_.push(R12); a_.push(R13); a_.push(R14); a_.push(R15);
-    a_.sub_imm(RSP, 8);              // six pushes leave rsp 8 off a 16-byte boundary; every call out needs it aligned
+    if (abi::kPreservesRdiRsi) { a_.push(RDI); a_.push(RSI); }   // callee-saved only on Windows
+    // On entry rsp is 8 off a 16-byte boundary, and each push moves it by 8: after six
+    // it is still 8 off, after eight too. Every call out needs it aligned, plus the
+    // shadow space the Microsoft ABI wants at rsp for the callee.
+    a_.sub_imm(RSP, 8 + abi::kShadow);
     a_.mov_imm64(RBP, kFiniteLimit);  // see finite_check
-    a_.mov(RBX, RDI);
-    a_.mov(R14, RSI);
+    a_.mov(RBX, abi::A0);
+    a_.mov(R14, abi::A1);
     a_.mov_load(R12, mem(RBX, kOffRegs));
     a_.mov_load(R13, mem(RBX, kOffAcc));
     a_.mov_load(R15, mem(R14, static_cast<int32_t>(offsetof(JitRt, ics))));
-    a_.jmp_reg(RDX);
+    a_.jmp_reg(abi::A2);
 }
 
 void Compiler::emit_shared_tails() {
@@ -1332,7 +1363,8 @@ void Compiler::emit_shared_tails() {
     spill_acc();
     a_.mov_imm32(RAX, static_cast<uint32_t>(kExitFinished));
     a_.bind(epilogue_);
-    a_.add_imm(RSP, 8);
+    a_.add_imm(RSP, 8 + abi::kShadow);
+    if (abi::kPreservesRdiRsi) { a_.pop(RSI); a_.pop(RDI); }
     a_.pop(R15); a_.pop(R14); a_.pop(R13); a_.pop(R12); a_.pop(RBX); a_.pop(RBP);
     a_.ret();
 }
@@ -1350,11 +1382,10 @@ void Compiler::finite_check(Reg bits, Reg tmp, Label& slow) {
 
 void Compiler::emit_step_call(const Insn& in, uint32_t target, uint32_t ic) {
     spill_acc();
-    a_.mov(RDI, RBX);
-    a_.mov_imm32(RSI, in.pc);
-    a_.mov_imm32(RDX, in.len);
-    a_.mov_imm32(RCX, target);
-    a_.mov_imm32(R8, ic);
+    a_.mov(abi::A0, RBX);
+    a_.mov_imm32(abi::A1, in.pc);
+    a_.mov_imm32(abi::A2, target);
+    a_.mov_imm32(abi::A3, ic);
     a_.call_abs(reinterpret_cast<const void*>(&step));
     reload_acc();
 }
@@ -1402,7 +1433,7 @@ void Compiler::branch(int cond, uint32_t from_pc, uint32_t target_pc) {
         a_.sub32_mem_imm(mem(R14, offsetof(JitRt, sp_counter)), 1);
         a_.jcc(CC_G, dest);
         spill_acc();
-        a_.mov(RDI, RBX);
+        a_.mov(abi::A0, RBX);
         a_.call_abs(reinterpret_cast<const void*>(&safepoint));
         a_.jmp(dest);
         return;
@@ -1414,7 +1445,7 @@ void Compiler::branch(int cond, uint32_t from_pc, uint32_t target_pc) {
         a_.sub32_mem_imm(mem(R14, offsetof(JitRt, sp_counter)), 1);
         a_.jcc(CC_G, dest);
         spill_acc();
-        a_.mov(RDI, RBX);
+        a_.mov(abi::A0, RBX);
         a_.call_abs(reinterpret_cast<const void*>(&safepoint));
         a_.jmp(dest);
     });
@@ -1777,9 +1808,9 @@ void Compiler::emit_set_keyed(const Insn& in, size_t idx) {
 
 void Compiler::emit_call(const Insn& in, uint32_t kind) {
     spill_acc();
-    a_.mov(RDI, RBX);
-    a_.mov_imm32(RSI, in.pc);
-    a_.mov_imm32(RDX, kind);
+    a_.mov(abi::A0, RBX);
+    a_.mov_imm32(abi::A1, in.pc);
+    a_.mov_imm32(abi::A2, kind);
     a_.call_abs(reinterpret_cast<const void*>(&call_op));
     reload_acc();
     const uint32_t next = in.pc + in.len;
@@ -1800,9 +1831,9 @@ void Compiler::emit_fast_cold(const Insn& in, Label& slow, const void* fn, uint3
     cold_.push_back([this, in, &slow, &step_label, fn, kind, produces_acc, &resume]() {
         a_.bind(slow);
         spill_acc();
-        a_.mov(RDI, RBX);
-        a_.mov_imm32(RSI, in.pc);
-        a_.mov_imm32(RDX, kind);
+        a_.mov(abi::A0, RBX);
+        a_.mov_imm32(abi::A1, in.pc);
+        a_.mov_imm32(abi::A2, kind);
         a_.call_abs(fn);
         a_.test32(RAX, RAX);
         a_.jcc(CC_E, step_label);
@@ -1817,9 +1848,9 @@ void Compiler::emit_fast_cold(const Insn& in, Label& slow, const void* fn, uint3
 void Compiler::emit_fast_inline(const Insn& in, const void* fn, uint32_t kind, bool produces_acc, int fused_dst) {
     Label& step_label = new_label();
     spill_acc();
-    a_.mov(RDI, RBX);
-    a_.mov_imm32(RSI, in.pc);
-    a_.mov_imm32(RDX, kind);
+    a_.mov(abi::A0, RBX);
+    a_.mov_imm32(abi::A1, in.pc);
+    a_.mov_imm32(abi::A2, kind);
     a_.call_abs(fn);
     a_.test32(RAX, RAX);
     a_.jcc(CC_E, step_label);
@@ -1835,9 +1866,9 @@ void Compiler::emit_binary_cold(const Insn& in, Label& slow, uint32_t binop) {
     cold_.push_back([this, in, &slow, binop, resume, next]() {
         a_.bind(slow);
         spill_acc();
-        a_.mov(RDI, RBX);
-        a_.mov_imm32(RSI, in.pc);
-        a_.mov_imm32(RDX, binop);
+        a_.mov(abi::A0, RBX);
+        a_.mov_imm32(abi::A1, in.pc);
+        a_.mov_imm32(abi::A2, binop);
         a_.call_abs(reinterpret_cast<const void*>(&binary_op));
         reload_acc();
         if (resume) {
@@ -2150,16 +2181,16 @@ void Compiler::emit_insn(size_t idx) {
 // would evict the others'.
 bool alloc_exec(const std::vector<uint8_t>& bytes, void*& mem, size_t& size, uint8_t*& start) {
     static uint32_t counter = 0;
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t page = platform::page_size();
     const size_t lines = page / 64;
     const size_t offset = (static_cast<size_t>(counter++) * 7 % lines) * 64;
     size = (offset + bytes.size() + page - 1) / page * page;
     if (g_cfg.mapped_bytes + size > g_cfg.max_mapped_bytes) return false;
-    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return false;
+    void* p = platform::map_writable(size);
+    if (!p) return false;
     std::memcpy(static_cast<uint8_t*>(p) + offset, bytes.data(), bytes.size());
     // Written once, then never writable again while it can run.
-    if (mprotect(p, size, PROT_READ | PROT_EXEC) != 0) { munmap(p, size); return false; }
+    if (!platform::make_executable(p, size)) { platform::unmap(p, size); return false; }
     mem = p;
     start = static_cast<uint8_t*>(p) + offset;
     g_cfg.mapped_bytes += size;
@@ -2244,7 +2275,7 @@ std::unique_ptr<JitCode, JitCodeDeleter> Compiler::compile(const char*& why) {
     jc->rt.table = jc->native_off.data();
     jc->rt.base = start;
     jc->start_off = jc->native_off[0];
-    jc->entry = reinterpret_cast<uint64_t (*)(void*, JitCode*, const void*)>(start);
+    jc->entry = reinterpret_cast<decltype(jc->entry)>(start);   // carries the ABI the prologue was written for
 
     if (g_cfg.dump_dir) {
         char path[512];
@@ -2257,7 +2288,7 @@ std::unique_ptr<JitCode, JitCodeDeleter> Compiler::compile(const char*& why) {
 void free_code(JitCode* c) noexcept {
     if (!c) return;
     if (c->mem) {
-        munmap(c->mem, c->mem_size);
+        platform::unmap(c->mem, c->mem_size);
         g_cfg.mapped_bytes -= c->mem_size;
     }
     delete c;
