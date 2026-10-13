@@ -56,13 +56,18 @@ private:
     // byte with whatever 8-byte-aligned field follows it) by 56 bytes total,
     // and beat grouping at the end of the class instead of here by a
     // further 8 bytes.
-    bool has_exception_ : 1 = false;
+    // The flags the call path reads and writes on every call are whole bytes, not
+    // bits of the group below: a bit-field store is a load, a mask and a store
+    // (and several of them are saved and restored around each call), a byte is
+    // one instruction -- and the exception test after every call is one compare
+    // instead of a load and a bit test. Nine bytes the packing used to save.
+    bool has_exception_ = false;
     bool has_return_value_ : 1 = false;
     bool has_break_ : 1 = false;
     bool has_continue_ : 1 = false;
-    bool is_in_constructor_call_ : 1 = false;
-    bool super_called_ : 1 = false;
-    bool this_needs_super_ : 1 = false;  // derived class ctor: accessing 'this' before super() throws
+    bool is_in_constructor_call_ = false;
+    bool super_called_ = false;
+    bool this_needs_super_ = false;  // derived class ctor: accessing 'this' before super() throws
     // Set when a native call reused this exact context (Function.cpp's
     // is_native_ branch), or when this context was captured as a Generator's
     // outer_context_ / an AsyncFunction's Promise::context_ -- both bypass
@@ -77,15 +82,15 @@ private:
     // Set by Function::construct() right before it calls Function::call() on the same
     // function, so call() can tell "I'm the construct invocation" apart from a plain call
     // made from inside that constructor's body (which must see new.target == undefined).
-    bool pending_construct_call_ : 1 = false;
-    bool strict_mode_ : 1 = false;
+    bool pending_construct_call_ = false;
+    bool strict_mode_ = false;
     bool in_param_eval_ : 1 = false;
     bool is_direct_eval_call_ : 1 = false;
     bool eval_arguments_conflict_ : 1 = false;
-    bool is_arrow_function_context_ : 1 = false;
+    bool is_arrow_function_context_ = false;
     bool in_class_field_init_ : 1 = false;
-    bool last_construct_explicit_return_ : 1 = false;  // see last_construct_explicit_return()
-    bool last_super_override_needs_reparent_ : 1 = false;  // see last_super_override_needs_reparent()
+    bool last_construct_explicit_return_ = false;  // see last_construct_explicit_return()
+    bool last_super_override_needs_reparent_ = false;  // see last_super_override_needs_reparent()
     // Owned by the Collector: which major epoch last reached this context
     // through a real edge (not through the survivor pool, which roots its
     // entries unconditionally). A stamp rather than a flag so that opening a

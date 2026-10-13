@@ -5832,6 +5832,60 @@ Value h_gen_CallResolved(Frame& f, uint32_t pc, Value acc) {
     DISPATCH();
 }
 
+// A call that threw, seen from the handler that made it: the catch handler that
+// covers the call instruction, or a return to this frame's caller. Out of line
+// so the call handlers below keep the search -- a loop over the handler table --
+// out of the body that every call, thrown or not, has to run.
+[[gnu::noinline]] Value h_ExceptionAt(Frame& f, uint32_t instr_pc_value, Value acc) {
+    const BytecodeChunk& chunk = f.chunk;
+    uint32_t pc = instr_pc_value;
+    uint32_t instr_pc = instr_pc_value;
+    CHECK_EXC_TAIL();
+    DISPATCH();
+}
+
+// Call and CallResolved when the callee is a plain compiled function, which
+// is nearly all of them. The generated handlers they stand in for hold the
+// whole instruction in registers across the call -- six saved registers, the
+// operand decode, two exception tests -- when all that has to survive it is the
+// frame and the pc. Anything else (a native, a Proxy, a callee that needs the
+// general entry, a non-function) tail-calls the generated handler untouched.
+Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& callee = f.regs[code[pc + 1]];
+    if (LIKELY(callee.is_function())) {
+        Function* fn = callee.as_function();
+        if (LIKELY(fn->fast_callable())) {
+            f.instr_pc = pc;
+            Context& ctx = *f.ctx;
+            acc = fn->call_fast_gate(ctx, std::span<const Value>(f.regs + code[pc + 2], code[pc + 3]), Value());
+            if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
+            Collector::safepoint();
+            pc += 6;
+            DISPATCH();
+        }
+    }
+    [[clang::musttail]] return h_gen_Call(f, pc, acc);
+}
+
+Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& callee = f.regs[code[pc + 1]];
+    if (LIKELY(callee.is_function())) {
+        Function* fn = callee.as_function();
+        if (LIKELY(fn->fast_callable())) {
+            f.instr_pc = pc;
+            Context& ctx = *f.ctx;
+            acc = fn->call_fast_gate(ctx, std::span<const Value>(f.regs + code[pc + 3], code[pc + 4]), f.regs[code[pc + 2]]);
+            if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
+            Collector::safepoint();
+            pc += 7;
+            DISPATCH();
+        }
+    }
+    [[clang::musttail]] return h_gen_CallResolved(f, pc, acc);
+}
+
 // `X.call(thisArg, ...rest)`, compiled as if "call" were an ordinary method
 // (args_start/argc count the WHOLE original argument list, thisArg
 // included -- see Bytecode.h's own comment). The fast path below answers
@@ -8989,8 +9043,8 @@ constexpr std::array<Handler, 256> make_handler_table() {
     t[static_cast<uint8_t>(Op::ThrowSuperDelete)] = &h_gen_ThrowSuperDelete;
     t[static_cast<uint8_t>(Op::LinkExports)] = &h_gen_LinkExports;
     t[static_cast<uint8_t>(Op::CopyRestProperties)] = &h_gen_CopyRestProperties;
-    t[static_cast<uint8_t>(Op::Call)] = &h_gen_Call;
-    t[static_cast<uint8_t>(Op::CallResolved)] = &h_gen_CallResolved;
+    t[static_cast<uint8_t>(Op::Call)] = &h_CallLean;
+    t[static_cast<uint8_t>(Op::CallResolved)] = &h_CallResolvedLean;
     t[static_cast<uint8_t>(Op::CallViaFunctionCall)] = &h_gen_CallViaFunctionCall;
     t[static_cast<uint8_t>(Op::CallViaFunctionApply)] = &h_gen_CallViaFunctionApply;
     t[static_cast<uint8_t>(Op::Construct)] = &h_gen_Construct;

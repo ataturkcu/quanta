@@ -2140,8 +2140,11 @@ protected:
     // null means the args came from registers and only a native forces a
     // materialization. It also decides the GC root: a vector's storage is
     // malloc'd and invisible to the stack scan, registers are not.
-    Value call_gated(Context& ctx, std::span<const Value> args, Value this_value);
-    Value call_gated_general(Context& ctx, std::span<const Value> args, Value this_value);
+    // Always inlined into its two callers in Function.cpp: the call that reaches it
+    // already paid for a frame, and a frame of its own for the short form cost
+    // another six saves and restores per call.
+    [[gnu::always_inline]] Value call_gated(Context& ctx, std::span<const Value> args, Value this_value);
+    [[gnu::noinline]] Value call_gated_general(Context& ctx, std::span<const Value> args, Value this_value);
     // own_context: the body must not run on the caller's Context, which the register-mode
     // paths do (a callee of another realm has to stand on one rooted in its own).
     Value call_default_impl(Context& ctx, std::span<const Value> args, Value this_value,
