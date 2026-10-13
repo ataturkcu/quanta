@@ -125,8 +125,57 @@ inline uint32_t read_u32(const uint8_t* code, uint32_t pc) {
            (static_cast<uint32_t>(code[pc + 2]) << 16) | (static_cast<uint32_t>(code[pc + 3]) << 24);
 }
 
+// Whether `a === b` is settled by the values' own bits: 0 false, 1 true, 2 not
+// settled (two strings, two BigInts or two symbols, whose equality is a matter of
+// content). Mirrors Value::strict_equals, which asks the same questions one kind at
+// a time -- about a hundred instructions through apply_operator for an answer that
+// is a compare, and `===` on non-numbers (an object against null, a tag against a
+// tag) is most of what a symbolic interpreter like EarleyBoyer does.
+inline int strict_equal_quick(const Value& a, const Value& b) {
+    if (a.is_finite_double()) return b.is_finite_double() && a.as_finite_double() == b.as_finite_double();
+    if (b.is_finite_double()) return 0;   // a finite number is equal to no other kind, nor to Infinity/NaN
+    if (std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b)) return !a.is_nan();   // NaN is the one value unequal to itself
+    // Different bits, neither a finite double: only a pair of the same content-compared
+    // kind can still be equal. Different objects, a different tag, true against false,
+    // Infinity against NaN -- all false.
+    if ((a.is_string() && b.is_string()) || (a.is_bigint() && b.is_bigint()) ||
+        (a.is_symbol() && b.is_symbol())) return 2;
+    return 0;
+}
+
+// `object instanceof Function` for the case the loop in OrdinaryHasInstance is the
+// whole answer: nothing anywhere has its own Symbol.hasInstance, the right side is
+// an unbound function with an object-valued prototype, and no Proxy (whose
+// getPrototypeOf trap can run code) is on the left or in its chain. Anything else
+// is left to apply_operator, which also owns every error. Settles `out` and returns
+// true when it answered.
+inline bool instanceof_quick(const Value& l, const Value& r, bool& out) {
+    if (!r.is_function() || !l.is_object() || !Object::has_instance_protector_intact()) return false;
+    static const std::string kBoundTarget = "__bound_target__";
+    Function* ctor = r.as_function();
+    if (ctor->has_internal_slot(kBoundTarget)) return false;
+    const Value prototype = ctor->constructor_prototype();
+    if (!prototype.is_object()) return false;
+    const Object* target = prototype.as_object();
+    const Object* o = l.as_object();
+    if (o->get_type() == Object::ObjectType::Proxy) return false;
+    for (const Object* p = o->get_prototype_raw(); p; p = p->get_prototype_raw()) {
+        if (p->get_type() == Object::ObjectType::Proxy) return false;
+        if (p == target) { out = true; return true; }
+    }
+    out = false;
+    return true;
+}
+
 // Routes through the shared apply_operator so VM and tree-walker semantics can't drift.
 inline Value binary_slow(Context& ctx, BinOp op, const Value& l, const Value& r) {
+    if (op == BinOp::STRICT_EQUAL || op == BinOp::STRICT_NOT_EQUAL) {
+        const int q = strict_equal_quick(l, r);
+        if (q != 2) return Value((q == 1) == (op == BinOp::STRICT_EQUAL));
+    } else if (op == BinOp::INSTANCEOF) {
+        bool result;
+        if (instanceof_quick(l, r, result)) return Value(result);
+    }
     return BinaryExpression::apply_operator(ctx, op, l, r);
 }
 
@@ -2221,8 +2270,33 @@ NUMERIC_BINARY_HANDLER(h_TestLe, BinOp::LESS_EQUAL, Value(l <= r))
 NUMERIC_BINARY_HANDLER(h_TestGe, BinOp::GREATER_EQUAL, Value(l >= r))
 NUMERIC_BINARY_HANDLER(h_TestEq, BinOp::EQUAL, Value(l == r))
 NUMERIC_BINARY_HANDLER(h_TestNe, BinOp::NOT_EQUAL, Value(l != r))
-NUMERIC_BINARY_HANDLER(h_TestStrictEq, BinOp::STRICT_EQUAL, Value(l == r))
-NUMERIC_BINARY_HANDLER(h_TestStrictNe, BinOp::STRICT_NOT_EQUAL, Value(l != r))
+// The strict comparisons settle most non-numeric operands without a frame: the
+// values' own bits decide (see strict_equal_quick), so only two strings, BigInts or
+// symbols reach the slow half. The macro's handler would have gone there for every
+// object, null, boolean and undefined it was handed.
+#define STRICT_EQUALITY_HANDLER(name, binop, want_equal)                   \
+    Value name##_slow(Frame& f, uint32_t pc, Value acc) {                  \
+        const BytecodeChunk& chunk = f.chunk;                              \
+        Context& ctx = *f.ctx;                                             \
+        uint32_t& instr_pc = f.instr_pc;                                   \
+        instr_pc = pc;                                                     \
+        acc = binary_slow(ctx, binop, f.regs[f.code[pc + 1]], acc);        \
+        pc += 2;                                                           \
+        CHECK_EXC_TAIL();                                                  \
+        DISPATCH();                                                        \
+    }                                                                      \
+    Value name(Frame& f, uint32_t pc, Value acc) {                         \
+        const Value& lhs = f.regs[f.code[pc + 1]];                         \
+        const int q = strict_equal_quick(lhs, acc);                        \
+        if (LIKELY(q != 2)) {                                              \
+            acc = Value((q == 1) == (want_equal));                         \
+            pc += 2;                                                       \
+            DISPATCH();                                                    \
+        }                                                                  \
+        [[clang::musttail]] return name##_slow(f, pc, acc);                \
+    }
+STRICT_EQUALITY_HANDLER(h_TestStrictEq, BinOp::STRICT_EQUAL, true)
+STRICT_EQUALITY_HANDLER(h_TestStrictNe, BinOp::STRICT_NOT_EQUAL, false)
 
 // A bitwise op is a couple of instructions of real work, so the handler stays
 // as lean as the arithmetic one and splits its fallback out the same way.
@@ -2497,6 +2571,22 @@ Value h_gen_Exp(Frame& f, uint32_t pc, Value acc) {
     } while (0);
     CHECK_EXC_TAIL();
     DISPATCH();
+}
+
+Value h_gen_TestInstanceOf(Frame& f, uint32_t pc, Value acc);
+
+// The common `instanceof` -- an object, an unbound function, no Proxy, no
+// Symbol.hasInstance anywhere -- is a walk up the prototype chain, which needs
+// neither the context nor an exception check, so it is answered before the
+// general handler builds its frame.
+Value h_TestInstanceOf(Frame& f, uint32_t pc, Value acc) {
+    bool result;
+    if (LIKELY(instanceof_quick(f.regs[f.code[pc + 1]], acc, result))) {
+        acc = Value(result);
+        pc += 2;
+        DISPATCH();
+    }
+    [[clang::musttail]] return h_gen_TestInstanceOf(f, pc, acc);
 }
 
 Value h_gen_TestInstanceOf(Frame& f, uint32_t pc, Value acc) {
@@ -8606,7 +8696,7 @@ constexpr std::array<Handler, 256> make_handler_table() {
     t[static_cast<uint8_t>(Op::Shl)] = &h_Shl;
     t[static_cast<uint8_t>(Op::Sar)] = &h_Sar;
     t[static_cast<uint8_t>(Op::Shr)] = &h_Shr;
-    t[static_cast<uint8_t>(Op::TestInstanceOf)] = &h_gen_TestInstanceOf;
+    t[static_cast<uint8_t>(Op::TestInstanceOf)] = &h_TestInstanceOf;
     t[static_cast<uint8_t>(Op::TestIn)] = &h_gen_TestIn;
     t[static_cast<uint8_t>(Op::ForInKeyPresent)] = &h_gen_ForInKeyPresent;
     t[static_cast<uint8_t>(Op::LdaArgLength)] = &h_LdaArgLength;
