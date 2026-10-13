@@ -21,7 +21,7 @@ The loop is: write the micro-benchmark for the thing, annotate the function that
 
 ## Where the instructions go
 
-A large real-world program (a 3 MB minified player script, 482 million bytecodes, ~36 G instructions after this work, ~77 per bytecode) spends them roughly like this:
+A large real-world program (a 3 MB minified player script, 482 million bytecodes, ~35 G instructions after this work, ~77 per bytecode) spends them roughly like this:
 
 | | share |
 |---|---|
@@ -60,9 +60,25 @@ Measured with the benchmark suite in `count.sh` (Richards, DeltaBlue, RayTrace, 
 
 **`Value(Object*)` is inline** (it is a null test and the object's type bits; it sat behind a call at every allocation and every property read that returned an object).
 
+**Natives go through the lean call handlers too.** `Call`/`CallResolved` take any function callee, compiled or native; the generated handlers they replaced paid six saved registers and two exception tests around every `charCodeAt`/`push`/`indexOf`. ~48 instructions per native call.
+
+**A captured parameter's environment slot is predicted where it is created.** In a function whose other names live in registers, the entry bytecode copies a captured parameter into the environment *after* every local; the compiler predicted the slot *before* them, so each guarded `LdaEnvSlot` of it missed and walked the scope chain by name. A closure-call loop spent 14% on it.
+
+**`==`/`!=` are settled by the values' bits** for nullish, object and boolean pairs (`loose_equal_quick`, mirroring `apply_operator`'s EQUAL/NOT_EQUAL cases) instead of falling to the tree-walker's `apply_operator` for everything but two numbers -- including `x != null`, most of what loose equality is used for. Richards −4.5%.
+
+**Megamorphic sites got two fixes and a new cache.** A constructor shared by many "classes" (`Class.create()`'s `function() { this.initialize.apply(this, arguments); }`, the Prototype.js idiom, still common in old libraries) sees the same shapes under many prototypes.
+* The thread-wide read cache indexed its entries by (shape, name) only, so twelve prototypes evicted each other; and an entry whose epoch had gone stale was never refreshed within a sweep generation (the "already decided" early return ignored the epoch), so after the first prototype change a site missed on every read until the next collection. Entries are now keyed on the prototype and relearn when the chain has changed.
+* The per-site store-transition cache replaced an entry for the same shape whatever its prototype, so the same twelve prototypes thrashed it; it now keeps one per (shape, prototype) up to its capacity.
+* Past that capacity, a site now uses a thread-wide transition cache (`MegaTransition`) keyed on (shape, name, prototype), valid for one `proto_epoch` and one sweep generation like the read cache, and only for an Ordinary, extensible receiver with no descriptor map. It records a transition only when the new shape is the old one plus exactly that property -- a store that ran an inherited setter also moves the object, to a shape holding whatever the setter's body added, and replaying that for a plain store would skip the setter (caught by the embed regression test).
+RayTrace −20% from these; a 12-class construct loop −73%.
+
+**`F.prototype` read off a function is the field** (`Function::has_plain_prototype`), skipping the name checks and descriptor walk of the general path. RayTrace −5%.
+
+**`new F()` through its own lean handler** (`h_ConstructLean`) and a `Function::construct` that is only the choice of road (the general body moved out so a plain `new` does not pay its frame).
+
 **Smaller things:** register-bank initialisation, the argument copy (a plain loop; left alone the compiler turns it into a `memcpy` call that costs more than the copy for one to three arguments), frameless `Jump`/`JumpIf`/bitwise handlers and `read_*` helpers that compile to single loads, `h_BackEdgeDue` as the only place a loop back-edge reaches the collector or the JIT.
 
-Taken together: the suite is −8.5% against the start of this round, and the real-world script went from 41.5 G to ~35.8 G instructions (−14%).
+Taken together: the benchmark suite is −13% against the start of this round (RayTrace −22%, Richards −14%, DeltaBlue −12%, Earley-Boyer −10%), and the real-world script went from 41.5 G to 34.8 G instructions (−16%; ~10% less wall-clock time on a quiet machine, RSS +1%). On the V8 benchmark scores the same build is ahead of the one it started from by Richards +22%, DeltaBlue +23%, RayTrace +50%, Earley-Boyer +9%; Splay and RegExp did not move (garbage collection and the regular-expression engine, not the interpreter).
 
 ## Tried and not kept
 

@@ -178,7 +178,7 @@ inline int strict_equal_quick(const Value& a, const Value& b) {
 // their bits. Everything that needs a conversion (a number against a string, a boolean
 // against anything else, an object against a primitive) and the content-compared kinds are
 // apply_operator's. Mirrors its EQUAL/NOT_EQUAL cases.
-inline int loose_equal_quick(const Value& a, const Value& b) {
+[[gnu::always_inline]] inline int loose_equal_quick(const Value& a, const Value& b) {
     const bool a_nullish = a.is_nullish();
     const bool b_nullish = b.is_nullish();
     if (a_nullish || b_nullish) return a_nullish && b_nullish;
@@ -6090,6 +6090,30 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
     [[clang::musttail]] return h_gen_CallResolved(f, pc, acc);
 }
 
+Value h_gen_Construct(Frame& f, uint32_t pc, Value acc);
+
+// `new F(...)` with F a function, keeping only the frame and pc across the call (see
+// h_CallLean). Anything else -- a Proxy, a non-constructor -- is the generated handler's.
+Value h_ConstructLean(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& callee = f.regs[code[pc + 1]];
+    if (LIKELY(callee.is_function())) {
+        f.instr_pc = pc;
+        Context& ctx = *f.ctx;
+        // A literal `new X()` targets X regardless of any ambient new.target from an
+        // enclosing constructor call.
+        const Value old_new_target = ctx.get_new_target();
+        ctx.set_new_target(callee);
+        acc = callee.as_function()->construct(ctx, std::span<const Value>(f.regs + code[pc + 2], code[pc + 3]));
+        ctx.set_new_target(old_new_target);
+        if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
+        Collector::safepoint();
+        pc += 6;
+        DISPATCH();
+    }
+    [[clang::musttail]] return h_gen_Construct(f, pc, acc);
+}
+
 // `X.call(thisArg, ...rest)`, compiled as if "call" were an ordinary method
 // (args_start/argc count the WHOLE original argument list, thisArg
 // included -- see Bytecode.h's own comment). The fast path below answers
@@ -7118,18 +7142,6 @@ Value h_GetNamedRest(Frame& f, uint32_t pc, Value acc) {
             FUSED_TAIL(6);
         }
     }
-    // `F.prototype`, read off a function: the field itself, where the general path checks the
-    // key against "arguments", "caller", "name" and "length" first and then walks the
-    // descriptors -- the commonest read a function receiver gets (`new` setups, class
-    // factories, every `instanceof` written by hand).
-    if (receiver.is_function()) {
-        static const std::string* const kPrototype = Shape::intern("prototype");
-        Function* fn = receiver.as_function();
-        if (&f.chunk.name_at(read_u16(code, pc + 2)) == kPrototype && fn->has_plain_prototype()) {
-            acc = fn->constructor_prototype();
-            FUSED_TAIL(6);
-        }
-    }
     if (LIKELY(receiver.is_object())) {
         Object* obj = receiver.as_object();
         if (obj->get_type() == Object::ObjectType::Array) {
@@ -7272,6 +7284,23 @@ Value h_GetNamedRest(Frame& f, uint32_t pc, Value acc) {
             }
         }
     } else if (receiver.is_function()) {
+        // `F.prototype`, read off a function: the field itself, where the general path checks the
+        // key against "arguments", "caller", "name" and "length" first and then walks the
+        // descriptors -- the commonest read a function receiver gets (`new` setups, class
+        // factories, every `instanceof` written by hand).
+        {
+            // The interned "prototype", made on the first function read this thread does (a plain
+            // thread_local, so the test is one load rather than a guarded static).
+            static constinit thread_local const std::string* prototype_name = nullptr;
+            if (UNLIKELY(!prototype_name)) prototype_name = Shape::intern("prototype");
+            if (f.chunk.names[read_u16(code, pc + 2)] == prototype_name) {
+                Function* fn = receiver.as_function();
+                if (fn->has_plain_prototype()) {
+                    acc = fn->constructor_prototype();
+                    FUSED_TAIL(6);
+                }
+            }
+        }
         // A function is not is_object() (see Value's own tag split), so it
         // never reaches the branch above -- but Function IS-A Object in the
         // C++ hierarchy, and as_object() reads the same payload bits
@@ -9275,7 +9304,7 @@ constexpr std::array<Handler, 256> make_handler_table() {
     t[static_cast<uint8_t>(Op::CallResolved)] = &h_CallResolvedLean;
     t[static_cast<uint8_t>(Op::CallViaFunctionCall)] = &h_gen_CallViaFunctionCall;
     t[static_cast<uint8_t>(Op::CallViaFunctionApply)] = &h_gen_CallViaFunctionApply;
-    t[static_cast<uint8_t>(Op::Construct)] = &h_gen_Construct;
+    t[static_cast<uint8_t>(Op::Construct)] = &h_ConstructLean;
     t[static_cast<uint8_t>(Op::CallSpread)] = &h_gen_CallSpread;
     t[static_cast<uint8_t>(Op::ConstructSpread)] = &h_gen_ConstructSpread;
     t[static_cast<uint8_t>(Op::CreateRegExp)] = &h_gen_CreateRegExp;

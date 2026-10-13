@@ -2147,9 +2147,12 @@ Value Function::construct(Context& ctx, const std::vector<Value>& args) {
     return construct(ctx, std::span<const Value>(args));
 }
 
+// The entry is only the choice of road, kept small so that a plain `new` does not pay the
+// general road's frame (it saves and restores most of the registers, for branches a base
+// constructor never takes).
 Value Function::construct(Context& ctx, std::span<const Value> args) {
     // Check if this function is a constructor
-    if (!is_constructor_) {
+    if (UNLIKELY_NATIVE(!is_constructor_)) {
         ctx.throw_exception(Value("TypeError: " + get_name() + " is not a constructor"));
         return Value();
     }
@@ -2162,7 +2165,10 @@ Value Function::construct(Context& ctx, std::span<const Value> args) {
         Value built;
         if (construct_plain(ctx, args, built)) return built;
     }
+    return construct_general(ctx, args);
+}
 
+[[gnu::noinline]] Value Function::construct_general(Context& ctx, std::span<const Value> args) {
     // The prototype is resolved before the object exists, so nothing runs
     // between allocating it and giving it one -- which is what lets the
     // install below skip a barrier it could have nothing to do.

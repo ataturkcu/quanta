@@ -2078,6 +2078,7 @@ public:
     Value construct(Context& ctx, std::span<const Value> args);
     void learn_construct_slot_hint(const Object* built);
     bool construct_plain(Context& ctx, std::span<const Value> args, Value& out);
+    Value construct_general(Context& ctx, std::span<const Value> args);
     bool new_target_is_self_or_none(const Context& ctx) const;
     // For a caller that arrived with a vector: its storage is malloc'd and
     // invisible to the stack scan, so it is rooted for the duration.
