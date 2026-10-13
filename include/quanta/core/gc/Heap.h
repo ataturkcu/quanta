@@ -50,7 +50,9 @@ public:
     // Active heap of this thread; set by Engine init (HeapScope), read by
     // the cell operator new hooks.
     static Heap* active_or_null() { return active_; }
-    static Heap& active();
+    // Inline: every cell allocation asks for it. (An engine installs a HeapScope before
+    // any cell is created, so it is never null here.)
+    static Heap& active() { return *active_; }
     static void  set_active(Heap* heap) { active_ = heap; }
 
     void* allocate(size_t size, CellKind kind,

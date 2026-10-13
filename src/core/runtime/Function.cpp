@@ -705,7 +705,7 @@ Value Function::call_gated_general(Context& ctx, std::span<const Value> args, Va
                 // closure_context_ directly. Same fix as call_default_impl's
                 // fast_no_closures path.
                 Object* global = nullptr;
-                if (Engine::all_engines().size() > 1 && closure_context_ && closure_context_ != &ctx) {
+                if (Engine::multi_engine() && closure_context_ && closure_context_ != &ctx) {
                     global = closure_context_->get_global_this();
                 }
                 if (!global) global = ctx.get_global_this();
@@ -716,7 +716,7 @@ Value Function::call_gated_general(Context& ctx, std::span<const Value> args, Va
                 // (every ordinary method call), not just primitives. ToObject
                 // must produce a wrapper from THIS function's own realm (see
                 // the global-this substitution above for why ctx isn't it).
-                Context& box_ctx = (Engine::all_engines().size() > 1 && closure_context_ && closure_context_ != &ctx)
+                Context& box_ctx = (Engine::multi_engine() && closure_context_ && closure_context_ != &ctx)
                     ? *closure_context_ : ctx;
                 fast_this = ObjectFactory::box_primitive_this_sloppy(box_ctx, this_value);
             }
@@ -1015,7 +1015,7 @@ Value Function::call_default_impl(Context& ctx, std::span<const Value> args, Val
                     // so a cross-realm call must ask closure_context_ directly
                     // rather than the shared ctx it would otherwise read.
                     Object* global = nullptr;
-                    if (Engine::all_engines().size() > 1 && closure_context_ && closure_context_ != &ctx) {
+                    if (Engine::multi_engine() && closure_context_ && closure_context_ != &ctx) {
                         global = closure_context_->get_global_this();
                     }
                     if (!global) global = ctx.get_global_this();
@@ -1023,7 +1023,7 @@ Value Function::call_default_impl(Context& ctx, std::span<const Value> args, Val
                 } else if (!this_value.is_object() && !this_value.is_function()) {
                     // ToObject must produce a wrapper from THIS function's own
                     // realm -- same reasoning as the global-this substitution above.
-                    Context& box_ctx = (Engine::all_engines().size() > 1 && closure_context_ && closure_context_ != &ctx)
+                    Context& box_ctx = (Engine::multi_engine() && closure_context_ && closure_context_ != &ctx)
                         ? *closure_context_ : ctx;
                     actual_this = ObjectFactory::box_primitive_this_sloppy(box_ctx, this_value);
                 }
@@ -1898,7 +1898,7 @@ Object* Function::ensure_prototype() const {
     // cache in create_object() happens to hold once 2+ realms exist.
     // closure_context_ is null for native functions, so this only fires for
     // JS-source functions/classes -- free in the single/no-realm case.
-    if (closure_context_ && Engine::all_engines().size() > 1) {
+    if (closure_context_ && Engine::multi_engine()) {
         if (Object* realm_proto = Engine::get_realm_intrinsic_prototype(closure_context_, "Object")) {
             proto->initialize_prototype_of_new(realm_proto);
         }

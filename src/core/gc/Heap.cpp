@@ -26,11 +26,6 @@ constinit thread_local size_t Heap::bytes_since_major_ = 0;
 constinit thread_local size_t Heap::live_after_major_ = 0;
 constinit thread_local size_t Heap::offheap_since_major_ = 0;
 
-Heap& Heap::active() {
-    assert(active_ && "no active Heap -- Engine init must install a HeapScope "
-                      "before any GC cell is created");
-    return *active_;
-}
 
 namespace {
 

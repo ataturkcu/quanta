@@ -5926,26 +5926,26 @@ Value h_gen_CallResolved(Frame& f, uint32_t pc, Value acc) {
     DISPATCH();
 }
 
-// Call and CallResolved when the callee is a plain compiled function, which
-// is nearly all of them. The generated handlers they stand in for hold the
+// Call and CallResolved when the callee is a function -- compiled or native,
+// which is nearly all of them. The generated handlers they stand in for hold the
 // whole instruction in registers across the call -- six saved registers, the
 // operand decode, two exception tests -- when all that has to survive it is the
-// frame and the pc. Anything else (a native, a Proxy, a callee that needs the
-// general entry, a non-function) tail-calls the generated handler untouched.
+// frame and the pc. A callee that is not a function (a Proxy, a non-callable)
+// tail-calls the generated handler untouched.
 Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
     const Value& callee = f.regs[code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable())) {
-            f.instr_pc = pc;
-            Context& ctx = *f.ctx;
-            acc = fn->call_fast_gate(ctx, std::span<const Value>(f.regs + code[pc + 2], code[pc + 3]), Value());
-            if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
-            Collector::safepoint();
-            pc += 6;
-            DISPATCH();
-        }
+        f.instr_pc = pc;
+        Context& ctx = *f.ctx;
+        const std::span<const Value> call_args(f.regs + code[pc + 2], code[pc + 3]);
+        acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, Value())
+                                          : fn->call_register_args(ctx, call_args, Value());
+        if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
+        Collector::safepoint();
+        pc += 6;
+        DISPATCH();
     }
     [[clang::musttail]] return h_gen_Call(f, pc, acc);
 }
@@ -5955,15 +5955,16 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
     const Value& callee = f.regs[code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable())) {
-            f.instr_pc = pc;
-            Context& ctx = *f.ctx;
-            acc = fn->call_fast_gate(ctx, std::span<const Value>(f.regs + code[pc + 3], code[pc + 4]), f.regs[code[pc + 2]]);
-            if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
-            Collector::safepoint();
-            pc += 7;
-            DISPATCH();
-        }
+        f.instr_pc = pc;
+        Context& ctx = *f.ctx;
+        const std::span<const Value> call_args(f.regs + code[pc + 3], code[pc + 4]);
+        const Value& receiver = f.regs[code[pc + 2]];
+        acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, receiver)
+                                          : fn->call_register_args(ctx, call_args, receiver);
+        if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
+        Collector::safepoint();
+        pc += 7;
+        DISPATCH();
     }
     [[clang::musttail]] return h_gen_CallResolved(f, pc, acc);
 }
