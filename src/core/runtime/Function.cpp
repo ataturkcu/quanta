@@ -539,7 +539,53 @@ Value Function::call_default(Context& ctx, const std::vector<Value>& args, Value
 // own so the call handlers can reach it without going through the general
 // entry's checks and frame. The caller has established the gate and holds the
 // call-stack frame.
+//
+// This is the call that writes nothing to the caller's Context: a plain
+// function whose strictness is the caller's, that does not read `this` and is
+// not an arrow. Those identity fields live in packed bit-fields, where saving
+// and restoring five of them around every call cost about thirty instructions
+// -- more than the checks that prove none of them changes -- so the general
+// form below is reached only by the calls that do change one.
 Value Function::call_gated(Context& ctx, std::span<const Value> args, Value this_value) {
+    if (Realm* foreign = foreign_realm(); UNLIKELY_NATIVE(foreign)) {
+        return call_gated_in_realm(foreign, ctx, args, this_value);
+    }
+    if (UNLIKELY_NATIVE(&ctx == g_borrowed_ctx)) {
+        return call_default_impl(ctx, args, this_value, nullptr, /*own_context=*/true);
+    }
+    const FunctionExecutable& exe = *executable_;
+    // `this` can go through untouched when the body reads it from the frame
+    // (Op::LdaThis) and nothing needs it re-bound: a strict callee takes it as
+    // it is, a sloppy one only when it is already an object -- boxing a
+    // primitive or substituting the global object is the general form's job.
+    // A body that reaches `this` through the Context instead (super) needs it
+    // written there, which is also the general form's.
+    const bool callee_strict = is_strict_ || exe.fast_strict;
+    if (UNLIKELY_NATIVE(is_arrow_ || exe.fast_uses_super || ctx.this_needs_super() ||
+                        ctx.is_strict_mode() != callee_strict ||
+                        (exe.fast_uses_this && !callee_strict &&
+                         !this_value.is_object() && !this_value.is_function()))) {
+        return call_gated_general(ctx, args, this_value);
+    }
+    Environment* outer_env = get_closure_environment();
+    if (!outer_env && closure_context_) outer_env = closure_context_->get_lexical_environment();
+    if (!outer_env) outer_env = ctx.get_lexical_environment();
+    // See call_gated_general for why only a chunk that can create a closure marks.
+    if (outer_env && !exe.fast_no_closures) outer_env->mark_escaped();
+    VM::CallInfo call_info;
+    call_info.lexical_environment_ = outer_env;
+    call_info.variable_environment_ = outer_env;
+    Context* prev_context = Object::current_context_;
+    Object::current_context_ = &ctx;
+    Value vm_result = VM::run_register_call(*exe.bytecode_chunk, ctx, args, &this_value, this, &call_info);
+    Object::current_context_ = prev_context;
+    if (ctx.has_exception()) return Value();
+    return vm_result;
+}
+
+// The general form of call_gated: saves and restores every per-call identity
+// field of the caller's Context, and handles `this`, arrows and strictness.
+Value Function::call_gated_general(Context& ctx, std::span<const Value> args, Value this_value) {
     // 10.2.1.1 PrepareForOrdinaryCall: the callee runs in its own realm. Almost
     // every call finds it already current, which is the one compare this costs.
     if (Realm* foreign = foreign_realm(); UNLIKELY_NATIVE(foreign)) {

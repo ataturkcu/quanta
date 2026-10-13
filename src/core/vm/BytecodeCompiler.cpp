@@ -7107,6 +7107,7 @@ void BytecodeCompiler::emit(Op op) {
     if (op == Op::LdaThis || op == Op::GetSuper || op == Op::SetSuper ||
         op == Op::ResolveSuperBase || op == Op::SuperCall || op == Op::SuperCallSpread) {
         chunk_->uses_this = true;
+        if (op != Op::LdaThis) chunk_->uses_super = true;
     }
     if (op == Op::Await || op == Op::AsyncIteratorNextOrJump ||
         op == Op::AsyncIteratorClose || op == Op::DisposeScope) {

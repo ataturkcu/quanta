@@ -382,6 +382,7 @@ public:
     // the same reason the gate is: every write to an input already recomputes.
     mutable bool fast_strict = false;
     mutable bool fast_uses_this = false;
+    mutable bool fast_uses_super = false;
     // Whether the body is nothing but a return of a constant, `this` or `this.name`
     // (VM::leaf_candidate). Kept here rather than read off the chunk so that a call
     // to any other function pays one test of a byte beside fast_gate, which that
@@ -429,6 +430,7 @@ public:
                         closure_props_state == 0;
         fast_strict = strict_directive_state == 1;
         fast_uses_this = bytecode_chunk && bytecode_chunk->uses_this;
+        fast_uses_super = bytecode_chunk && bytecode_chunk->uses_super;
         fast_leaf = fast_gate && bytecode_chunk && VM::leaf_candidate(*bytecode_chunk);
         fast_no_closures = bytecode_chunk && !bytecode_chunk->has_nested_closures;
     }

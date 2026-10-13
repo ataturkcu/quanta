@@ -997,6 +997,10 @@ struct BytecodeChunk {
     // a chunk without it can skip setting one up, including the sloppy-mode
     // substitution that boxes a primitive or reaches for the global object.
     bool uses_this : 1 = false;
+    // The part of uses_this that is not Op::LdaThis: super property access and
+    // super calls, which read `this` from the Context rather than the frame.
+    // Only these make a call write the Context's this_value.
+    bool uses_super : 1 = false;
     // Set by emit() when any opcode that can call await_value goes into the
     // code: Op::Await itself, Op::AsyncIteratorNextOrJump/AsyncIteratorClose
     // (for-await-of's own per-iteration await, a different opcode entirely

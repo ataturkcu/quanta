@@ -173,7 +173,7 @@ public:
         return v;
     }
     [[nodiscard]] inline bool is_vm_tdz_sentinel() const noexcept {
-        return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_VM_TDZ);
+        return has_tag_(TAG_VM_TDZ);
     }
 
     explicit Value(bool b) : bits_(QUIET_NAN | (b ? TAG_TRUE : TAG_FALSE)) {}
@@ -243,28 +243,38 @@ public:
     Value& operator=(const Value& other) = default;
     Value& operator=(Value&& other) noexcept = default;
 
-    [[nodiscard]] inline bool is_undefined() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_UNDEFINED); }
-    [[nodiscard]] inline bool is_null() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_NULL); }
+    // Whether the value carries exactly this tag. Compares the top sixteen bits
+    // (sign, exponent, tag) after a shift, not under a 64-bit mask: the mask
+    // needs its constant in a register, the shift does not, and in a handler
+    // that tests two or three types that is an instruction or two each time.
+    // Same answer as masking off the sign: a double whose exponent is all ones
+    // is turned into a tagged NaN or infinity with a clear sign by every
+    // constructor, so no value has both the sign and an all-ones exponent.
+    [[nodiscard]] inline bool has_tag_(uint64_t tag) const noexcept {
+        return (bits_ >> 48) == ((QUIET_NAN | tag) >> 48);
+    }
+    [[nodiscard]] inline bool is_undefined() const noexcept { return has_tag_(TAG_UNDEFINED); }
+    [[nodiscard]] inline bool is_null() const noexcept { return has_tag_(TAG_NULL); }
     [[nodiscard]] inline bool is_boolean() const noexcept {
-        return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_FALSE) ||
-               (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_TRUE);
+        return has_tag_(TAG_FALSE) ||
+               has_tag_(TAG_TRUE);
     }
     [[nodiscard]] inline bool is_number() const noexcept {
         return (bits_ & EXPONENT_MASK) != EXPONENT_MASK ||
-               (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_NAN) ||
-               (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_NEG_INF) ||
-               (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_POS_INF);
+               has_tag_(TAG_NAN) ||
+               has_tag_(TAG_NEG_INF) ||
+               has_tag_(TAG_POS_INF);
     }
     [[nodiscard]] inline bool is_nan() const noexcept {
-        return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_NAN);
+        return has_tag_(TAG_NAN);
     }
-    [[nodiscard]] inline bool is_positive_infinity() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_POS_INF); }
-    [[nodiscard]] inline bool is_negative_infinity() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_NEG_INF); }
-    [[nodiscard]] inline bool is_string() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_STRING); }
-    [[nodiscard]] inline bool is_symbol() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_SYMBOL); }
-    [[nodiscard]] inline bool is_bigint() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_BIGINT); }
-    [[nodiscard]] inline bool is_object() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_OBJECT); }
-    [[nodiscard]] inline bool is_function() const noexcept { return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_FUNCTION); }
+    [[nodiscard]] inline bool is_positive_infinity() const noexcept { return has_tag_(TAG_POS_INF); }
+    [[nodiscard]] inline bool is_negative_infinity() const noexcept { return has_tag_(TAG_NEG_INF); }
+    [[nodiscard]] inline bool is_string() const noexcept { return has_tag_(TAG_STRING); }
+    [[nodiscard]] inline bool is_symbol() const noexcept { return has_tag_(TAG_SYMBOL); }
+    [[nodiscard]] inline bool is_bigint() const noexcept { return has_tag_(TAG_BIGINT); }
+    [[nodiscard]] inline bool is_object() const noexcept { return has_tag_(TAG_OBJECT); }
+    [[nodiscard]] inline bool is_function() const noexcept { return has_tag_(TAG_FUNCTION); }
     
     inline bool is_primitive() const { 
         return is_undefined() || is_null() || is_boolean() || is_number() || is_string() || is_symbol() || is_bigint();
@@ -281,7 +291,7 @@ public:
     Type get_type() const;
 
     inline bool as_boolean() const {
-        return (bits_ & (QUIET_NAN | TAG_MASK)) == (QUIET_NAN | TAG_TRUE);
+        return has_tag_(TAG_TRUE);
     }
     // A finite double is the whole of arithmetic's fast path, and it is one
     // test: NaN and both infinities are given NaN-box tags of their own, so
