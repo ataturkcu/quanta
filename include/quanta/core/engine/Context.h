@@ -649,7 +649,12 @@ public:
             // comes from Shape::intern, so it is never null, which makes the
             // pointer both the key and the occupancy flag.
             const std::string* key = nullptr;
-            BindingSlot slot;
+            // Left unconstructed until the entry is taken: every way of taking one assigns
+            // `slot = BindingSlot{}` first, and nothing reads a slot whose key is null. An
+            // environment is built per call, and writing six empty slots into each of them
+            // was most of what building one cost.
+            union { BindingSlot slot; };
+            InlineEntry() noexcept {}
         };
         std::array<InlineEntry, kInlineCapacity> inline_entries;
         // Exact-sized continuation of inline_entries, for an environment whose
