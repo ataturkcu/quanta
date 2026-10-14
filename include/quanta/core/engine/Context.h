@@ -1133,6 +1133,20 @@ public:
     // declares, so every declared binding gets an index instead of spilling
     // into the hash map. Sized once, never grown.
     void reserve_slots(size_t total) { slots_.reserve(total); }
+    // Whether this is a declarative environment that has nothing bound yet and room for `n`
+    // bindings in its entries, so that seed_binding can lay them down by index.
+    bool fresh_with_room(size_t n) const {
+        return type_ != Type::Object && !slots_.overflow && !slots_.inline_entries[0].key &&
+               n <= SlotMap::kInlineCapacity + slots_.ext_capacity;
+    }
+    // Binds `key` in entry `index` with no lookup. Only on an environment fresh_with_room says
+    // yes to, with distinct keys; no write barrier, since an environment nothing has traced
+    // yet needs none (see Collector::write_barrier_env).
+    void seed_binding(size_t index, const std::string* key, const BindingSlot& slot) {
+        SlotMap::InlineEntry* e = slots_.entry_at(index);
+        e->key = key;
+        e->slot = slot;
+    }
     // What this environment costs in real memory: the object plus whatever its
     // slot storage allocated alongside it. The survivor path charges this
     // toward the collector's budget, which only ever saw the object before.

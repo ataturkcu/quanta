@@ -9780,9 +9780,35 @@ template <bool Fast>
             for (const auto& p : b.env_params) b.env_param_keys.push_back(Shape::intern(p));
             b.env_local_keys.reserve(b.env_locals.size());
             for (const auto& l : b.env_locals) b.env_local_keys.push_back(Shape::intern(l.name));
+            bool distinct = true;
+            std::vector<const std::string*> every(b.env_param_keys);
+            every.insert(every.end(), b.env_local_keys.begin(), b.env_local_keys.end());
+            for (size_t i = 0; i < every.size() && distinct; i++)
+                for (size_t j = i + 1; j < every.size(); j++)
+                    if (every[i] == every[j]) { distinct = false; break; }
+            b.env_seed_flags.clear();
+            for (const auto& l : b.env_locals)
+                b.env_seed_flags.push_back(static_cast<uint8_t>((l.is_lexical ? 1 : 0) | (l.is_lexical && l.is_const ? 2 : 0)));
+            b.env_seed_ok = distinct && !chunk.env_params_tdz && !chunk.lex_scope_split;
             b.env_keys_ready = true;
         }
-        if (chunk.env_params_tdz) {
+        if (chunk.env->env_seed_ok &&
+            env->fresh_with_room(chunk.env->env_param_keys.size() + chunk.env->env_local_keys.size())) {
+            // The common case: a fresh call environment and distinct names. Same bindings, same
+            // order and flags as the generic path below, without a lookup per name.
+            size_t at = 0;
+            const size_t nparams = chunk.env->env_param_keys.size();
+            for (size_t i = 0; i < nparams; i++) {
+                env->seed_binding(at++, chunk.env->env_param_keys[i],
+                                  Environment::BindingSlot{i < args.size() ? args[i] : Value(), true, true, false});
+            }
+            for (size_t li = 0; li < chunk.env->env_local_keys.size(); li++) {
+                const uint8_t fl = chunk.env->env_seed_flags[li];
+                Environment::BindingSlot slot{Value(), (fl & 2) == 0, (fl & 1) == 0, false};
+                if (fl & 2) slot.const_binding = true;
+                env->seed_binding(at++, chunk.env->env_local_keys[li], slot);
+            }
+        } else if (chunk.env_params_tdz) {
             // Spec FDI ordering: params start uninitialized (their raw values
             // sit in registers), the entry bytecode initializes each one left
             // to right, and Op::BindEnvLocals creates the body's bindings
