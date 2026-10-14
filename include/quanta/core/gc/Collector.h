@@ -115,7 +115,19 @@ public:
     // Records `cell` (base address of a live cell) as mutated. Needed on
     // every post-construction write of a traced field or property slot;
     // no-op for young cells since a minor trace reaches them anyway.
-    static void write_barrier(const void* cell);
+    // A container nothing has marked yet -- the usual case, an object made a moment ago -- needs
+    // no record (a minor trace reaches it from the roots, and an open major will trace it after
+    // the write), so that is settled here from the block's mark bit; only a marked one pays for
+    // the call.
+    static void write_barrier(const void* cell) {
+        if (__builtin_expect(!cell, 0)) return;
+        if (__builtin_expect(!Heap::any_large_cell().load(std::memory_order_relaxed), 1) &&
+            !HeapBlock::from_cell(cell)->test_mark(cell)) {
+            return;
+        }
+        write_barrier_slow(cell);
+    }
+    static void write_barrier_slow(const void* cell);
     // The same barrier, for a caller that knows which value it is storing.
     // Incremental marking needs the new edge not to be missed, and there are
     // two ways to get that: re-trace the container, or shade the target. The

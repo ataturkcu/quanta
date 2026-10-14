@@ -1494,7 +1494,7 @@ Collector::SliceResult Collector::mark_step(std::chrono::microseconds budget) {
     return SliceResult::CycleComplete;
 }
 
-void Collector::write_barrier(const void* cell) {
+void Collector::write_barrier_slow(const void* cell) {
     if (barriers_disabled() || !cell) return;
     // Every caller hands its own `this` -- a cell base, never a guessed word.
     Heap::ProbeResult p = Heap::exact_cell_base(cell);
