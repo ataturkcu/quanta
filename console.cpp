@@ -481,6 +481,9 @@ static int run_console(int argc, char* argv[]) {
     }
 }
 
+#ifdef QUANTA_PGO_INSTRUMENT
+extern "C" int __llvm_profile_write_file(void);
+#endif
 int main(int argc, char* argv[]) {
     int code = run_console(argc, argv);
     // A normal `return` here runs global/static destructors and lets the
@@ -497,5 +500,9 @@ int main(int argc, char* argv[]) {
     // (d8, the SpiderMonkey shell, Node) actually exits.
     std::cout.flush();
     Quanta::VM::jit_print_stats();
+#ifdef QUANTA_PGO_INSTRUMENT
+    // _Exit skips the profile runtime's own exit hook; an instrumented build writes its counters here.
+    __llvm_profile_write_file();
+#endif
     std::_Exit(code);
 }

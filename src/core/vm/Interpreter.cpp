@@ -2405,7 +2405,7 @@ constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (
     InlineSlot& slot = arena.slots[arena.depth++];
     slot.call_info.lexical_environment_ = outer_env;
     slot.call_info.variable_environment_ = outer_env;
-    std::memset(slot.resolved_envs, 0, sizeof slot.resolved_envs);
+    // resolved_envs is not cleared: each slot is written by the resolve op before the op that reads it.
     Frame* callee = new (slot.frame_storage) Frame{
         chunk, f.ctx, std::span<const Value>(argv, argc), fn, true, regs, slot.env_saves, slot.resolved_envs,
         lookup_cache_data, private_feedback_data, chunk.code.data(), chunk.constants.data(), outer_env,
@@ -2516,12 +2516,19 @@ Value h_LdaConstWide(Frame& f, uint32_t pc, Value acc) {
 
 // Return from a stackless frame: its caller's next handler runs with the value as the
 // accumulator, exactly as the call handler would have gone on after a call that returned.
+// The collector's safepoint is a call on a path almost never taken, and having it here made this
+// handler save five registers on every return; so it only tests and hands the rare case on.
+[[gnu::noinline]] Value h_ReturnSafepoint(Frame& f, uint32_t pc, Value acc) {
+    Collector::safepoint_slow();
+    DISPATCH();
+}
+
 [[gnu::noinline]] Value h_ReturnInline(Frame& f, uint32_t pc, Value acc) {
     (void)pc;
     Frame* const caller = f.caller;
     const uint32_t return_pc = f.return_pc;
     inline_frame_pop(f);
-    Collector::safepoint();
+    if (UNLIKELY(Collector::safepoint_armed())) [[clang::musttail]] return h_ReturnSafepoint(*caller, return_pc, acc);
     [[clang::musttail]] return kHandlers[caller->code[return_pc]](*caller, return_pc, acc);
 }
 
