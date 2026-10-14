@@ -212,19 +212,35 @@ private:
     const std::vector<Value>* vec_;
 };
 
-// RAII form of push_environment_root/pop_environment_root -- see its own
-// comment for why this exists at all.
+// Roots one Environment pointer for as long as this object lives (see push_environment_root
+// for why environments need it at all). The roots are chained through the objects themselves,
+// which live in their owners' stack frames: registering one is two stores and dropping it one,
+// where the vector this replaced cost a thread-local guard and a bounds check on each side of
+// every call that has an environment of its own. Nearly always strictly nested; generator
+// fibers can interleave, which unlink_slow handles.
 class EnvironmentRoot {
 public:
-    explicit EnvironmentRoot(Environment* const* env_ptr) : env_ptr_(env_ptr) {
-        Collector::push_environment_root(env_ptr_);
+    explicit EnvironmentRoot(Environment* const* env_ptr) : env_ptr_(env_ptr), prev_(head_) { head_ = this; }
+    ~EnvironmentRoot() {
+        if (__builtin_expect(head_ == this, 1)) head_ = prev_;
+        else unlink_slow();
     }
-    ~EnvironmentRoot() { Collector::pop_environment_root(env_ptr_); }
     EnvironmentRoot(const EnvironmentRoot&) = delete;
     EnvironmentRoot& operator=(const EnvironmentRoot&) = delete;
 
+    // Drops every root that lives in [lo, hi): a fiber's stack is freed without unwinding it, so
+    // whatever it still had registered would otherwise stay in the chain, dangling.
+    static void purge(const void* lo, const void* hi);
+    // The innermost live root of this thread, and the next one out.
+    static EnvironmentRoot* head() { return head_; }
+    EnvironmentRoot* outer() const { return prev_; }
+    Environment* environment() const { return *env_ptr_; }
+
 private:
+    void unlink_slow();
+    static inline constinit thread_local EnvironmentRoot* head_ = nullptr;
     Environment* const* env_ptr_;
+    EnvironmentRoot* prev_;
 };
 
 // A chunk whose inline caches hold real cells -- a prototype, a holder, a

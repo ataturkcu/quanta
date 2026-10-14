@@ -1037,6 +1037,7 @@ void run_minor_collection() {
         for (ExecContextScope* s = engine->exec_top_scope(); s; s = s->prev())
             v.visit_context(s->context());
     for (Environment* const* env_ptr : environment_roots()) v.visit_environment(*env_ptr);
+    for (EnvironmentRoot* r = EnvironmentRoot::head(); r; r = r->outer()) v.visit_environment(r->environment());
     for (const std::vector<Value>* vec : value_vector_roots())
         for (const Value& val : *vec) v.visit(val);
     for (const FixedArray<Value>* arr : value_array_roots())
@@ -1177,6 +1178,7 @@ void scan_major_roots(MarkVisitor& v) {
         for (ExecContextScope* s = engine->exec_top_scope(); s; s = s->prev())
             v.revisit_context(s->context());
     for (Environment* const* env_ptr : environment_roots()) v.visit_environment(*env_ptr);
+    for (EnvironmentRoot* r = EnvironmentRoot::head(); r; r = r->outer()) v.visit_environment(r->environment());
     for (const std::vector<Value>* vec : value_vector_roots())
         for (const Value& val : *vec) v.visit(val);
     for (const FixedArray<Value>* arr : value_array_roots())
@@ -1706,6 +1708,21 @@ void Collector::pop_value_vector(const std::vector<Value>* vec) {
     if (!roots.empty() && roots.back() == vec) { roots.pop_back(); return; }
     for (size_t i = roots.size(); i-- > 0;) {
         if (roots[i] == vec) { roots.erase(roots.begin() + i); return; }
+    }
+}
+
+void EnvironmentRoot::purge(const void* lo, const void* hi) {
+    EnvironmentRoot** link = &head_;
+    while (*link) {
+        EnvironmentRoot* n = *link;
+        if (static_cast<const void*>(n) >= lo && static_cast<const void*>(n) < hi) *link = n->prev_;
+        else link = &n->prev_;
+    }
+}
+
+void EnvironmentRoot::unlink_slow() {
+    for (EnvironmentRoot* n = head_; n; n = n->prev_) {
+        if (n->prev_ == this) { n->prev_ = prev_; return; }
     }
 }
 
