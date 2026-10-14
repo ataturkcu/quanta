@@ -266,6 +266,7 @@ private:
             bits_ = (reinterpret_cast<uintptr_t>(s) & ~kMask) | (bits_ & kMask);
             return *this;
         }
+        uint64_t raw() const { return bits_; }
         ObjectType type() const { return static_cast<ObjectType>(bits_ & kMask); }
         void set_type(ObjectType t) { bits_ = (bits_ & ~kMask) | static_cast<uintptr_t>(t); }
     private:
@@ -827,6 +828,9 @@ public:
     // Callers must also check has_descriptor_override(key) before trusting
     // the slot value.
     Shape* get_shape() const { return shape_.get(); }
+    // The shape pointer together with the object-type bits, as stored: one compare of this
+    // against a cached word checks shape and type at once (FeedbackBody::Entry).
+    uint64_t raw_shape_word() const { return shape_.raw(); }
     // Whether a for-in reaching this object would report anything of its own.
     // A prototype that would not contributes nothing to the objects below it,
     // and answering that cheaply is what lets an ordinary for-in skip the
@@ -876,6 +880,10 @@ public:
         if (peek_extras()) return nullptr;
         return get_shape();
     }
+    // The slot a cached (shape, index) names, with no capacity test: a receiver whose shape
+    // matched the one the index was found on has that slot, the same fact Object::trace_fast
+    // relies on to walk the butterfly without checks.
+    Value* shape_slot_for_cached_index(uint32_t index) const { return butterfly_ + index; }
     const Value* get_shape_slot_unchecked(uint32_t index) const {
         return index < shape_capacity() ? shape_slot_ptr(index) : nullptr;
     }

@@ -273,8 +273,9 @@ bool key_is_canonical_index(const std::string& s, size_t& out_index) {
 // Forward decl: defined below, needed here since get_primitive_named's new
 // prototype-property cache reuses the same (shape, slot_index) learn helper
 // GetNamed's own receiver-shape cache uses.
+inline bool shape_fast_path_ok(Object::ObjectType t);
 void learn_feedback(FeedbackSlot* fb_slot, Shape* shape, uint32_t slot_index,
-                     bool is_accessor = false);
+                     bool is_accessor = false, const Object* receiver = nullptr);
 
 // write_barrier(owner) (see below) only re-remembers the one calling Function
 // instance, so its own trace() re-visits the shared chunk next cycle -- it
@@ -357,7 +358,7 @@ Value get_primitive_named(Context& ctx, const Value& prim, const std::string& na
     if (cacheable) {
         Shape* shape = proto_obj->get_shape();
         for (uint8_t i = 0; i < fb->count; i++) {
-            if (fb->entries[i].shape == shape) {
+            if (fb->entries[i].shape() == shape) {
                 if (!fb->entries[i].is_accessor) {
                     const Value* slot = proto_obj->get_shape_slot_unchecked(fb->entries[i].slot_index);
                     if (slot) return *slot;
@@ -436,21 +437,30 @@ void set_primitive_named(Context& ctx, const Value& prim, const std::string& nam
 // converging on one shape after their last field is added), and inserting a
 // duplicate would burn through the fixed budget without ever caching an
 // actually-distinct shape, tripping mega early for no benefit.
-void learn_feedback(FeedbackSlot* fb_slot, Shape* shape, uint32_t slot_index, bool is_accessor) {
+void learn_feedback(FeedbackSlot* fb_slot, Shape* shape, uint32_t slot_index, bool is_accessor,
+                    const Object* receiver) {
     // Reaching here is the site learning something, so the body exists
     // from this point on.
     FeedbackBody& fb = fb_slot->ensure();
     // A site that gave up stays given up, which is what lets going mega empty
     // the table below.
     if (fb.mega) return;
+    // What the own-property fast path may serve: a plain data slot on a type it is allowed for.
+    // Everything else is stored with the slow mark and found by the general handler's scan.
+    const uint64_t fast_word = (receiver && !is_accessor && shape_fast_path_ok(receiver->get_type()))
+                                   ? receiver->raw_shape_word() : 0;
     for (uint8_t i = 0; i < fb.count; i++) {
-        if (fb.entries[i].shape == shape) {
+        if (fb.entries[i].shape() == shape) {
             fb.entries[i].is_accessor = is_accessor;
+            fb.entries[i].set(shape, fast_word);
             return;
         }
     }
     if (fb.count < FeedbackSlot::kMaxEntries) {
-        fb.entries[fb.count++] = {shape, slot_index, is_accessor};
+        FeedbackBody::Entry& e = fb.entries[fb.count++];
+        e.slot_index = slot_index;
+        e.is_accessor = is_accessor;
+        e.set(shape, fast_word);
     } else {
         // Emptied as well as marked, so a live first entry is by itself proof
         // that the site is still caching: the read path then asks one question
@@ -458,7 +468,7 @@ void learn_feedback(FeedbackSlot* fb_slot, Shape* shape, uint32_t slot_index, bo
         // it looks at the table.
         fb.mega = true;
         fb.count = 0;
-        fb.entries[0].shape = nullptr;
+        fb.entries[0].clear();
     }
 }
 
@@ -937,7 +947,7 @@ Value get_named(Context& ctx, const Value& receiver, const std::string& name,
     // is safe to re-establish from a single receiver.
     if (fb && !fb->mega && fast_type_ok && obj_shape) {
         for (uint8_t i = 0; i < fb->count; i++) {
-            if (fb->entries[i].shape == obj_shape) {
+            if (fb->entries[i].shape() == obj_shape) {
                 if (!obj->has_any_descriptor_override()) {
                     const Value* slot = obj->get_shape_slot_unchecked(fb->entries[i].slot_index);
                     if (slot) {
@@ -964,7 +974,7 @@ Value get_named(Context& ctx, const Value& receiver, const std::string& name,
     if (cacheable && fb) {
         Shape* shape = obj_shape;
         for (uint8_t i = 0; i < fb->count; i++) {
-            if (fb->entries[i].shape == shape) {
+            if (fb->entries[i].shape() == shape) {
                 if (!fb->entries[i].is_accessor) {
                     const Value* slot = obj->get_shape_slot_unchecked(fb->entries[i].slot_index);
                     if (slot) return *slot;
@@ -988,7 +998,7 @@ Value get_named(Context& ctx, const Value& receiver, const std::string& name,
         if (obj->try_read_own_data_slot(name, fast_value)) {
             if (cacheable) {
                 int32_t idx = obj_shape ? obj_shape->find_slot(name) : -1;
-                if (idx >= 0) learn_feedback(fb_slot, obj_shape, static_cast<uint32_t>(idx));
+                if (idx >= 0) learn_feedback(fb_slot, obj_shape, static_cast<uint32_t>(idx), false, obj);
             }
             return fast_value;
         }
@@ -1036,7 +1046,7 @@ Value get_named(Context& ctx, const Value& receiver, const std::string& name,
             if (cacheable) {
                 Shape* s = obj->get_shape();
                 int32_t idx = s ? s->find_slot(name) : -1;
-                if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx));
+                if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx), false, obj);
             }
             // Learn only what the descriptor map itself answered. A shape-slot
             // value belongs to the entries above, which track it through shape
@@ -1192,7 +1202,7 @@ Value get_named(Context& ctx, const Value& receiver, const std::string& name,
     if (cacheable) {
         Shape* s = obj->get_shape();
         int32_t idx = s ? s->find_slot(name) : -1;
-        if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx));
+        if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx), false, obj);
     }
     // A function object holding the key in its own descriptor map: every
     // constructor-namespace builtin is one -- Number.isInteger, Object.keys,
@@ -1243,7 +1253,7 @@ void set_named(Context& ctx, const Value& receiver, const std::string& name,
     if (fb && !fb->mega && ordinary_recv) {
         Shape* shape = obj->get_shape();
         for (uint8_t i = 0; i < fb->count; i++) {
-            if (fb->entries[i].shape == shape) {
+            if (fb->entries[i].shape() == shape) {
                 // See get_named's own guard: a receiver with no descriptor map
                 // cannot shadow the slot, whatever the global stamp says.
                 if (!obj->has_any_descriptor_override()) {
@@ -1274,7 +1284,7 @@ void set_named(Context& ctx, const Value& receiver, const std::string& name,
         !obj->has_descriptor_override(name)) {
         Shape* shape = obj->get_shape();
         for (uint8_t i = 0; i < fb->count; i++) {
-            if (fb->entries[i].shape == shape) {
+            if (fb->entries[i].shape() == shape) {
                 if (fb->entries[i].is_accessor) break;
                 Value* slot = obj->get_shape_slot_unchecked(fb->entries[i].slot_index);
                 if (slot) { *slot = value; return; }
@@ -1299,7 +1309,7 @@ void set_named(Context& ctx, const Value& receiver, const std::string& name,
         if (idx >= 0) {
             *obj->get_shape_slot_unchecked(idx) = value;
             if (fb_slot && !(fb && fb->mega)) {
-                learn_feedback(fb_slot, shape, static_cast<uint32_t>(idx));
+                learn_feedback(fb_slot, shape, static_cast<uint32_t>(idx), false, obj);
             }
             return;
         }
@@ -1396,7 +1406,7 @@ void set_named(Context& ctx, const Value& receiver, const std::string& name,
         !obj->has_descriptor_override(name)) {
         Shape* s = obj->get_shape();
         int32_t idx = s ? s->find_slot(name) : -1;
-        if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx));
+        if (idx >= 0) learn_feedback(fb_slot, s, static_cast<uint32_t>(idx), false, obj);
     } else if (fb_slot && !(fb && fb->mega) && shape_fast_path_ok(obj->get_type()) &&
                !obj->find_descriptor_override(name)) {
         // has_descriptor_override is also true for an accessor-kind shape slot,
@@ -7446,19 +7456,18 @@ Value h_GetNamedFast(Frame& f, uint32_t pc, Value acc) {
     const Value& receiver = f.regs[code[pc + 1]];
     if (LIKELY(receiver.is_object())) {
         Object* obj = receiver.as_object();
+        const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
+        const FeedbackSlot::Entry& e = fb.entries[0];
+        // The receiver's own word -- shape and object type together -- against the one the site
+        // learned: a hit means a plain data property on a type this path serves (anything else
+        // is stored with a word no receiver has). The shape says the slot exists, which is the
+        // same promise the collector's trace relies on to walk the butterfly unchecked, so no
+        // capacity test here either.
+        if (LIKELY(e.word == obj->raw_shape_word() && !obj->has_any_descriptor_override())) {
+            acc = *obj->shape_slot_for_cached_index(e.slot_index);
+            FUSED_TAIL(6);
+        }
         if (LIKELY(shape_fast_path_ok(obj->get_type()))) {
-            const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
-            const FeedbackSlot::Entry& e = fb.entries[0];
-            // A non-null shape here means the site is neither empty nor
-            // megamorphic: going mega clears it (see learn_feedback).
-            if (LIKELY(e.shape && !e.is_accessor &&
-                       e.shape == obj->get_shape() &&
-                       !obj->has_any_descriptor_override())) {
-                if (const Value* slot = obj->get_shape_slot_unchecked(e.slot_index)) {
-                    acc = *slot;
-                    FUSED_TAIL(6);
-                }
-            }
             // The other read that decides most of them: a method or a field
             // found on the prototype, through the site's first inherited entry.
             // It costs the slower handler a five-register prologue and a scan
@@ -7556,7 +7565,7 @@ Value h_GetNamedRest(Frame& f, uint32_t pc, Value acc) {
             Shape* own_shape = obj->get_shape();
             for (uint8_t k = 0; k < fb.count; k++) {
                 const FeedbackSlot::Entry& cand = fb.entries[k];
-                if (cand.shape != own_shape) continue;
+                if (cand.shape() != own_shape) continue;
                 if (obj->has_any_descriptor_override()) break;
                 if (const Value* slot = obj->get_shape_slot_unchecked(cand.slot_index)) {
                     if (!cand.is_accessor) {
@@ -7904,23 +7913,17 @@ Value h_SetNamedFast(Frame& f, uint32_t pc, Value acc) {
     const Value& receiver = f.regs[code[pc + 1]];
     if (LIKELY(receiver.is_object())) {
         Object* obj = receiver.as_object();
+        const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
+        const FeedbackSlot::Entry& e = fb.entries[0];
+        // Same word compare as the read side; the stamp is global and never revived, the
+        // receiver's own map answers for itself.
+        if (LIKELY(e.word == obj->raw_shape_word() && !obj->has_any_descriptor_override())) {
+            *obj->shape_slot_for_cached_index(e.slot_index) = acc;
+            if (store_needs_barrier(acc)) [[clang::musttail]] return h_SetNamedBarrier(f, pc, acc);
+            pc += 6;
+            DISPATCH();
+        }
         if (LIKELY(shape_fast_path_ok(obj->get_type()))) {
-            const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
-            const FeedbackSlot::Entry& e = fb.entries[0];
-            // Same pair of facts as the read side: the stamp is global and
-            // never revived, the receiver's own map answers for itself.
-            // A non-null shape here means the site is neither empty nor
-            // megamorphic: going mega clears it (see learn_feedback).
-            if (LIKELY(e.shape && !e.is_accessor &&
-                       e.shape == obj->get_shape() &&
-                       !obj->has_any_descriptor_override())) {
-                if (Value* slot = obj->get_shape_slot_unchecked(e.slot_index)) {
-                    *slot = acc;
-                    if (store_needs_barrier(acc)) [[clang::musttail]] return h_SetNamedBarrier(f, pc, acc);
-                    pc += 6;
-                    DISPATCH();
-                }
-            }
             // New-property transition cache: see h_SetNamedTransition.
             if (LIKELY(!fb.transition_mega && fb.transition_count != 0)) {
                 [[clang::musttail]] return h_SetNamedTransition(f, pc, acc);
@@ -7945,7 +7948,7 @@ Value h_SetNamedRest(Frame& f, uint32_t pc, Value acc) {
             Shape* own_shape = obj->get_shape();
             for (uint8_t k = 1; k < fb.count; k++) {
                 const FeedbackSlot::Entry& e = fb.entries[k];
-                if (e.shape != own_shape || e.is_accessor) continue;
+                if (e.shape() != own_shape || e.is_accessor) continue;
                 if (obj->has_any_descriptor_override()) break;
                 if (Value* slot = obj->get_shape_slot_unchecked(e.slot_index)) {
                     write_barrier_for(obj, acc);
@@ -10412,8 +10415,8 @@ bool try_leaf_call(const BytecodeChunk& chunk, const Value& this_value, Value& o
         Shape* shape = obj->get_shape();
         for (uint8_t k = 0; k < fb.count; k++) {
             const FeedbackSlot::Entry& e = fb.entries[k];
-            if (e.shape != shape) continue;
-            if (!e.shape || e.is_accessor || obj->has_any_descriptor_override()) return false;
+            if (e.shape() != shape) continue;
+            if (!e.shape() || e.is_accessor || obj->has_any_descriptor_override()) return false;
             const Value* slot = obj->get_shape_slot_unchecked(e.slot_index);
             if (!slot) return false;
             out = *slot;

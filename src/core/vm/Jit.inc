@@ -298,8 +298,8 @@ void learn_ic(Frame* f, JitCode* jc, uint32_t pc, uint32_t block) noexcept {
     if (!fb->mega) {
         for (uint8_t k = 0; k < fb->count && n < JitIC::kWays; k++) {
             const FeedbackSlot::Entry& e = fb->entries[k];
-            if (!e.shape || e.is_accessor) continue;
-            fresh[n].shape_word = reinterpret_cast<uint64_t>(e.shape) | JitObjectLayout::kOrdinaryType;
+            if (!e.shape() || e.is_accessor) continue;
+            fresh[n].shape_word = reinterpret_cast<uint64_t>(e.shape()) | JitObjectLayout::kOrdinaryType;
             fresh[n].slot = e.slot_index;
             fresh[n].kind = JitIC::Own;
             n++;
@@ -543,7 +543,7 @@ int fast_get_named_impl(Frame* f, uint32_t pc, uint32_t ic_index) noexcept {
             Shape* own_shape = obj->get_shape();
             for (uint8_t k = 0; k < fb.count; k++) {
                 const FeedbackSlot::Entry& cand = fb.entries[k];
-                if (cand.shape != own_shape) continue;
+                if (cand.shape() != own_shape) continue;
                 if (obj->has_any_descriptor_override()) break;
                 if (const Value* slot = obj->get_shape_slot_unchecked(cand.slot_index)) {
                     if (!cand.is_accessor) { f->acc = *slot; return 1; }
@@ -633,7 +633,7 @@ int fast_set_named_impl(Frame* f, uint32_t pc) noexcept {
     Shape* own_shape = obj->get_shape();
     for (uint8_t k = 0; k < fb.count; k++) {
         const FeedbackSlot::Entry& e = fb.entries[k];
-        if (e.shape != own_shape || e.is_accessor) continue;
+        if (e.shape() != own_shape || e.is_accessor) continue;
         if (obj->has_any_descriptor_override()) break;
         if (Value* slot = obj->get_shape_slot_unchecked(e.slot_index)) {
             write_barrier_for(obj, acc);
@@ -1712,7 +1712,7 @@ void Compiler::emit_get_named(const Insn& in, size_t idx, bool fused) {
     // or only accessors) goes straight to the helper instead of paying for a
     // stub call that always misses.
     if (const FeedbackBody* fb = chunk_.feedback[u16(in.pc + 4)].peek()) {
-        const bool own = !fb->mega && fb->entries[0].shape && !fb->entries[0].is_accessor;
+        const bool own = !fb->mega && fb->entries[0].shape() && !fb->entries[0].is_accessor;
         const bool inherited = fb->proto_count != 0 && !fb->proto_mega;
         if (!own && !inherited) {
             emit_fast_inline(in, reinterpret_cast<const void*>(&fast_get_named), kNoOperand, true,
@@ -1760,7 +1760,7 @@ void Compiler::emit_set_named(const Insn& in, size_t idx) {
     // A site that adds properties (a constructor's `this.x = ...`) has no own
     // entry to cache: its work is the transition, which the helper does.
     if (const FeedbackBody* fb = chunk_.feedback[u16(in.pc + 4)].peek()) {
-        if (fb->mega || !fb->entries[0].shape || fb->entries[0].is_accessor) {
+        if (fb->mega || !fb->entries[0].shape() || fb->entries[0].is_accessor) {
             emit_fast_inline(in, reinterpret_cast<const void*>(&fast_set_named), kNoOperand, false, -1);
             (void)idx;
             return;

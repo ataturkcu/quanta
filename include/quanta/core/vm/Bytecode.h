@@ -516,7 +516,23 @@ struct FeedbackBody {
     // it. Lives in the padding slot_index's alignment already leaves. Every
     // reader that stores through slot_index, or hands its contents back as a
     // value, has to exclude these.
-    struct Entry { Shape* shape = nullptr; uint32_t slot_index = 0; bool is_accessor = false; };
+    struct Entry {
+        // The receiver's shape pointer with its object-type bits (Object::raw_shape_word), so
+        // that one compare of the receiver's own word settles both shape and type for the
+        // own-property fast path. An entry that path must not serve -- an accessor, or a
+        // shape learned from a type the fast path excludes -- carries kSlow, which no
+        // receiver's word has; the general handlers recover the shape with shape().
+        static constexpr uint64_t kSlow = uint64_t{1} << 62;
+        static constexpr uint64_t kTypeBits = 31;
+        uint64_t word = kSlow;     // empty: no shape, and never a match
+        uint32_t slot_index = 0;
+        bool is_accessor = false;
+        Shape* shape() const { return reinterpret_cast<Shape*>(word & ~(kSlow | kTypeBits)); }
+        void set(Shape* s, uint64_t fast_word) {
+            word = fast_word ? fast_word : (reinterpret_cast<uint64_t>(s) | kSlow);
+        }
+        void clear() { word = kSlow; }
+    };
     static constexpr uint8_t kMaxEntries = 8;
     std::array<Entry, kMaxEntries> entries{};
     uint8_t count = 0;
