@@ -680,6 +680,10 @@ std::vector<Environment* const*>& environment_roots() {
     return roots;
 }
 
+// The interpreter's side stack of registers for stackless calls (Collector::set_value_stack).
+struct ValueStackRange { Value* base = nullptr; Value* const* top = nullptr; };
+constinit thread_local ValueStackRange g_value_stack;
+
 std::vector<const FixedArray<Value>*>& value_array_roots() {
     static thread_local std::vector<const FixedArray<Value>*> roots;
     return roots;
@@ -1004,6 +1008,8 @@ void run_minor_collection() {
         for (const Value& val : *vec) v.visit(val);
     for (const FixedArray<Value>* arr : value_array_roots())
         for (const Value& val : *arr) v.visit(val);
+    if (g_value_stack.base)
+        for (const Value* p = g_value_stack.base; p < *g_value_stack.top; ++p) v.visit(*p);
     for (const BytecodeChunk* chunk : chunk_roots()) chunk->trace(v);
     Symbol::gc_trace_roots(v);
     String::gc_trace_roots(v);
@@ -1142,6 +1148,8 @@ void scan_major_roots(MarkVisitor& v) {
         for (const Value& val : *vec) v.visit(val);
     for (const FixedArray<Value>* arr : value_array_roots())
         for (const Value& val : *arr) v.visit(val);
+    if (g_value_stack.base)
+        for (const Value* p = g_value_stack.base; p < *g_value_stack.top; ++p) v.visit(*p);
     for (const BytecodeChunk* chunk : chunk_roots()) chunk->trace(v);
     Symbol::gc_trace_roots(v);
     String::gc_trace_roots(v);
@@ -1648,6 +1656,11 @@ void Collector::pop_chunk(const BytecodeChunk* chunk) {
     for (size_t i = roots.size(); i-- > 0;) {
         if (roots[i] == chunk) { roots.erase(roots.begin() + static_cast<long>(i)); return; }
     }
+}
+
+void Collector::set_value_stack(Value* base, Value* const* top) {
+    g_value_stack.base = base;
+    g_value_stack.top = top;
 }
 
 void Collector::push_value_vector(const std::vector<Value>* vec) {

@@ -2441,6 +2441,9 @@ bool osr(Frame& f, uint32_t target, const Value& acc) noexcept {
     if (jc->owner_thread != &g_thread_marker || target >= jc->code_size || jc->native_off[target] == 0) return false;
     f.pc = target;
     f.acc = acc;
+    // From here the generated code drives this activation, and its steps must not start
+    // stackless calls (see "Stackless calls" in Interpreter.cpp).
+    f.inline_ok = false;
     f.acc = run(f, jc);
     return true;
 }

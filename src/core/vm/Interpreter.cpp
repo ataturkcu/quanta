@@ -199,10 +199,15 @@ inline bool instanceof_quick(const Value& l, const Value& r, bool& out) {
     if (!r.is_function() || !l.is_object() || !Object::has_instance_protector_intact()) return false;
     static const std::string kBoundTarget = "__bound_target__";
     Function* ctor = r.as_function();
-    if (ctor->has_internal_slot(kBoundTarget)) return false;
-    const Value prototype = ctor->constructor_prototype();
-    if (!prototype.is_object()) return false;
-    const Object* target = prototype.as_object();
+    // Only a native can be a bound function (bind() makes one), and a function with a
+    // compiled body is asked nothing: the internal-slot lookup is a map probe.
+    if (ctor->is_native() && ctor->has_internal_slot(kBoundTarget)) return false;
+    const Object* target = ctor->get_function_prototype();
+    if (!target) {
+        const Value prototype = ctor->constructor_prototype();
+        if (!prototype.is_object()) return false;
+        target = prototype.as_object();
+    }
     const Object* o = l.as_object();
     if (o->get_type() == Object::ObjectType::Proxy) return false;
     for (const Object* p = o->get_prototype_raw(); p; p = p->get_prototype_raw()) {
@@ -2040,6 +2045,19 @@ struct Frame {
     // Back edges left before the interpreter offers this activation to the baseline
     // JIT (osr_try, Jit.inc): a loop that has run this long is worth compiling for.
     int32_t osr_budget = 300;
+    // Stackless calls (see InlineArena). A frame the interpreter built for a call it made
+    // itself, rather than one run_with_regs built on the C++ stack, has a caller: the Return
+    // that ends it dispatches the caller's next instruction instead of returning a value.
+    Frame* caller = nullptr;
+    // The activation's own frame -- the one run_with_regs built -- and, on that one, the
+    // innermost stackless frame it has running (null when there is none).
+    Frame* base = nullptr;
+    Frame* active = nullptr;
+    uint32_t return_pc = 0;
+    uint32_t value_words = 0;    // words this frame holds on the side stack
+    // Whether a call made from this frame may run as a stackless one: only an activation the
+    // interpreter itself is driving (not one the baseline JIT steps through).
+    bool inline_ok = false;
 };
 
 // The permanent form of the diagnostic's frame_lex_env_diag(f): falls back
@@ -2168,6 +2186,220 @@ bool osr_try(Frame& f, uint32_t target_pc, const Value& acc);
 
 extern const std::array<Handler, 256> kHandlers;
 
+// Sets the first `used` registers of a 32-register bank to undefined, four at a time (the
+// bank is 256 bytes, so rounding up to a multiple of four never leaves it). The loop it
+// replaces indexed each pair from a counter -- shift, shift, store, add, extend,
+// compare, branch -- eight instructions per two registers; walking a pointer is four
+// per four.
+[[gnu::always_inline]] inline void init_register_bank(unsigned char* bank, unsigned used) {
+    if (used == 0) return;
+    const uint64_t undef_bits = std::bit_cast<uint64_t>(Value());
+#if defined(__SSE2__)
+    const __m128i pair = _mm_set1_epi64x(static_cast<long long>(undef_bits));
+    __m128i* p = reinterpret_cast<__m128i*>(bank);
+    __m128i* const end = p + ((used + 3) >> 2) * 2;
+    do {
+        _mm_store_si128(p, pair);
+        _mm_store_si128(p + 1, pair);
+        p += 2;
+    } while (p < end);
+#else
+    for (unsigned i = 0; i < used; i++) std::memcpy(bank + i * sizeof(Value), &undef_bits, sizeof undef_bits);
+#endif
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Stackless calls
+//
+// A call from interpreted code to a plain compiled function used to be a C++ call chain: the
+// call handler, Function::call_fast_gate, run_register_call and finally the dispatch loop of the
+// callee, each with its own saved registers and frame, about three hundred instructions in all
+// before the callee's first bytecode. A stackless call builds the callee's Frame in a slot of a
+// per-thread arena and tail-calls straight into the callee's first handler; its Return finds the
+// Frame's `caller` and tail-calls the caller's next handler. The C++ stack does not grow with
+// JS call depth any more, and nothing is saved or restored around the transfer.
+//
+// What keeps it honest:
+//  * Only a frame the interpreter itself is driving may start one (Frame::inline_ok): a frame the
+//    baseline JIT steps through ends every step at a halt byte that a callee's code would never
+//    reach.
+//  * The callee must be a function the JIT has declined (jit_state == 2) or the JIT is off: one
+//    it would compile has to be entered through run_entry, or it never gets compiled.
+//  * The callee's registers live on a side stack of Values that the collector scans exactly
+//    (Collector::set_value_stack); the C++ stack scan cannot see them.
+//  * An exception that no handler of the callee's covers pops its frame and looks in the
+//    caller's, from the instruction that made the call (h_Unwind). A C++ exception from a native
+//    lands in run_with_regs, which finds the innermost stackless frame of its activation and does
+//    the same search (it is what Frame::base and Frame::active are for).
+//  * The side stack is a LIFO shared by every fiber of the thread. That holds because a fiber is
+//    only ever suspended by the base frame of a generator or async function (a plain function
+//    cannot yield or await), and a base frame has no stackless frames running at that moment.
+//
+// QUANTA_INLINE_CALLS=0 turns it off.
+namespace {
+
+constexpr uint32_t kInlineMaxRegs = 32;
+
+struct InlineSlot {
+    alignas(Frame) unsigned char frame_storage[sizeof(Frame)];
+    CallInfo call_info;
+    Environment* env_saves[64];
+    Environment* resolved_envs[8];
+    Frame& frame() { return *reinterpret_cast<Frame*>(frame_storage); }
+};
+
+struct InlineArena {
+    InlineSlot* slots = nullptr;
+    Value* values = nullptr;
+    Value* top = nullptr;
+    Value* limit = nullptr;
+    uint32_t depth = 0;
+};
+// Plain data and constant-initialised, so the hot path reads it with no thread-local guard;
+// the memory it points at is given back by ArenaOwner when the thread ends.
+constinit thread_local InlineArena g_arena;
+struct ArenaOwner {
+    ~ArenaOwner() {
+        if (g_arena.values) Collector::set_value_stack(nullptr, nullptr);
+        std::free(g_arena.slots);
+        std::free(g_arena.values);
+        g_arena = InlineArena{};
+    }
+};
+
+bool inline_calls_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("QUANTA_INLINE_CALLS");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// Words one frame reserves: `this` and a pad word (so the registers start 16-aligned), then the
+// registers rounded up to the four init_register_bank writes at a time.
+constexpr uint32_t inline_frame_words(uint32_t regs) { return 2 + ((regs + 3) & ~3u); }
+
+[[gnu::noinline]] bool inline_arena_init() {
+    constexpr size_t kDepth = CallStack::MAX_STACK_DEPTH;
+    constexpr size_t kWords = kDepth * inline_frame_words(kInlineMaxRegs);
+    g_arena.slots = static_cast<InlineSlot*>(std::malloc(sizeof(InlineSlot) * kDepth));
+    g_arena.values = static_cast<Value*>(std::aligned_alloc(64, sizeof(Value) * kWords));
+    if (!g_arena.slots || !g_arena.values) {
+        std::free(g_arena.slots);
+        std::free(g_arena.values);
+        g_arena.slots = nullptr;
+        g_arena.values = nullptr;
+        return false;
+    }
+    g_arena.top = g_arena.values;
+    g_arena.limit = g_arena.values + kWords;
+    g_arena.depth = 0;
+    Collector::set_value_stack(g_arena.values, &g_arena.top);
+    static thread_local ArenaOwner owner;
+    (void)owner;
+    return true;
+}
+
+// Takes a stackless frame off the arena and the call stack, and tells its activation's base.
+[[gnu::always_inline]] inline void inline_frame_pop(Frame& f) {
+    Frame* c = f.caller;
+    f.base->active = (c == f.base) ? nullptr : c;
+    g_arena.top -= f.value_words;
+    g_arena.depth--;
+    CallStack::instance().pop_frame_unchecked();
+}
+
+// Starts a stackless call of `fn` from `f` if everything allows it; true with the callee's
+// frame in `out` (the caller has only to dispatch it), false with nothing touched.
+[[gnu::always_inline]] inline bool inline_call_enter(Frame& f, Function* fn, const Value* argv, uint32_t argc,
+                                                       const Value& this_value, uint32_t return_pc, Frame*& out) {
+    if (!f.inline_ok) return false;
+    Context& ctx = *f.ctx;
+    const FunctionExecutable& exe = *fn->get_executable().get();
+    const bool callee_strict = fn->is_strict() || exe.fast_strict;
+    const BytecodeChunk& chunk = *exe.bytecode_chunk;
+    if (UNLIKELY(chunk.inline_state != 1)) {
+        // jit_state 0 is "not decided yet": ask again next call. Once the JIT has refused the
+        // chunk its shape is final, so the verdict is cached.
+        if (chunk.jit_state == 0) return false;
+        chunk.inline_state = (chunk.jit_state == 2 && !chunk.env_mode && chunk.register_count <= kInlineMaxRegs &&
+                              !exe.fast_uses_super && !exe.fast_leaf) ? 1 : 2;
+        if (chunk.inline_state != 1) return false;
+    }
+    if (UNLIKELY(fn->is_arrow() || ctx.this_needs_super() || ctx.is_strict_mode() != callee_strict ||
+                 (exe.fast_uses_this && !callee_strict && !this_value.is_object() && !this_value.is_function()))) {
+        return false;
+    }
+    if (UNLIKELY(g_track_positions || Engine::multi_engine() || fn->runs_in_foreign_realm())) return false;
+    InlineArena& arena = g_arena;
+    CallStack& stack = CallStack::instance();
+    if (UNLIKELY(!arena.values)) {
+        if (!inline_calls_enabled() || !inline_arena_init()) return false;
+    }
+    const uint32_t nregs = std::max<uint32_t>(chunk.register_count, chunk.parameter_count);
+    const uint32_t words = inline_frame_words(nregs);
+    if (UNLIKELY(stack.depth() + 1 >= CallStack::MAX_STACK_DEPTH || arena.top + words > arena.limit)) return false;
+    ctx.consume_pending_construct_call();
+
+    Environment* outer_env = fn->get_closure_environment();
+    if (!outer_env && fn->get_closure_context()) outer_env = fn->get_closure_context()->get_lexical_environment();
+    if (!outer_env) outer_env = ctx.get_lexical_environment();
+    if (outer_env && !exe.fast_no_closures) outer_env->mark_escaped();
+
+    // The caches an instance of a shared chunk keeps for itself -- see run_with_regs.
+    BytecodeChunk::LookupCacheEntry* lookup_cache_data = chunk.lookup_cache.data();
+    if (chunk.uses_lookup_cache) {
+        auto& instance_cache = fn->instance_lookup_cache();
+        if (instance_cache.size() < chunk.names.size()) instance_cache.resize(chunk.names.size());
+        lookup_cache_data = instance_cache.data();
+    }
+    const size_t private_count = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.size() : 0;
+    PrivateFeedback* private_feedback_data = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.data() : nullptr;
+    if (private_count > 0) {
+        auto& instance_pf = fn->instance_private_feedback();
+        if (instance_pf.size() < private_count) instance_pf.resize(private_count);
+        private_feedback_data = instance_pf.data();
+    }
+
+    Value* bank = arena.top;
+    Value* regs = bank + 2;
+    bank[0] = this_value;
+    init_register_bank(reinterpret_cast<unsigned char*>(regs), nregs);
+    const uint32_t copy = std::min<uint32_t>(chunk.parameter_count, argc);
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    for (uint32_t i = 0; i < copy; i++) {
+        regs[i] = argv[i];
+        __asm__ volatile("" ::: "memory");
+    }
+    arena.top = bank + words;
+
+    InlineSlot& slot = arena.slots[arena.depth++];
+    slot.call_info.lexical_environment_ = outer_env;
+    slot.call_info.variable_environment_ = outer_env;
+    std::memset(slot.resolved_envs, 0, sizeof slot.resolved_envs);
+    Frame* callee = new (slot.frame_storage) Frame{
+        chunk, f.ctx, std::span<const Value>(argv, argc), fn, true, regs, slot.env_saves, slot.resolved_envs,
+        lookup_cache_data, private_feedback_data, chunk.code.data(), chunk.constants.data(), outer_env,
+        this_value, Value(), 0, 0, 0, true};
+    callee->call_info = &slot.call_info;
+    callee->current_lexical_env = outer_env;
+    callee->current_variable_env = outer_env;
+    callee->osr_budget = INT32_MAX;
+    callee->caller = &f;
+    Frame* base = f.base ? f.base : &f;
+    callee->base = base;
+    callee->return_pc = return_pc;
+    callee->value_words = words;
+    callee->inline_ok = true;
+    base->active = callee;
+    stack.push_frame_unchecked(&ctx.get_current_filename(), fn);
+    out = callee;
+    return true;
+}
+
+}  // namespace
+
 #define DISPATCH() [[clang::musttail]] return kHandlers[f.code[pc]](f, pc, acc)
 
 // Opcodes that cannot raise: nothing but the dispatch separates one from the
@@ -2254,8 +2486,19 @@ Value h_LdaConstWide(Frame& f, uint32_t pc, Value acc) {
     DISPATCH();
 }
 
+// Return from a stackless frame: its caller's next handler runs with the value as the
+// accumulator, exactly as the call handler would have gone on after a call that returned.
+[[gnu::noinline]] Value h_ReturnInline(Frame& f, uint32_t pc, Value acc) {
+    (void)pc;
+    Frame* const caller = f.caller;
+    const uint32_t return_pc = f.return_pc;
+    inline_frame_pop(f);
+    Collector::safepoint();
+    [[clang::musttail]] return kHandlers[caller->code[return_pc]](*caller, return_pc, acc);
+}
+
 Value h_Return(Frame& f, uint32_t pc, Value acc) {
-    (void)f; (void)pc;
+    if (UNLIKELY(f.caller != nullptr)) [[clang::musttail]] return h_ReturnInline(f, pc, acc);
     return acc;
 }
 
@@ -6061,6 +6304,11 @@ Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
         f.instr_pc = pc;
         Context& ctx = *f.ctx;
         const std::span<const Value> call_args(f.regs + code[pc + 2], code[pc + 3]);
+        if (LIKELY(fn->fast_callable())) {
+            Frame* callee_frame;
+            if (inline_call_enter(f, fn, call_args.data(), static_cast<uint32_t>(call_args.size()), Value(), pc + 6, callee_frame))
+                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+        }
         acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, Value())
                                           : fn->call_register_args(ctx, call_args, Value());
         if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
@@ -6080,6 +6328,11 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
         Context& ctx = *f.ctx;
         const std::span<const Value> call_args(f.regs + code[pc + 3], code[pc + 4]);
         const Value& receiver = f.regs[code[pc + 2]];
+        if (LIKELY(fn->fast_callable())) {
+            Frame* callee_frame;
+            if (inline_call_enter(f, fn, call_args.data(), static_cast<uint32_t>(call_args.size()), receiver, pc + 7, callee_frame))
+                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+        }
         acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, receiver)
                                           : fn->call_register_args(ctx, call_args, receiver);
         if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
@@ -7481,7 +7734,30 @@ inline bool store_needs_barrier(const Value& value) {
 
 // A store that adds a property the site has seen added before: the shape changes and the
 // object gets one more slot, which is a call.
-[[gnu::noinline]] Value h_SetNamedTransition(Frame& f, uint32_t pc, Value acc) {
+[[gnu::noinline]] Value h_SetNamedTransitionSlow(Frame& f, uint32_t pc, Value acc);
+
+// The common add: a number or boolean (no barrier), a slot the object already has room for.
+// Nothing here calls, so the handler has no frame to build around the six checks and two
+// stores; a store that needs the collector's barrier or a bigger butterfly is the slow form's.
+Value h_SetNamedTransition(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const FeedbackBody& fb = f.chunk.feedback[read_u16(code, pc + 4)].read();
+    if (LIKELY(!fb.transition_mega && fb.transition_count != 0 && !store_needs_barrier(acc))) {
+        const FeedbackSlot::TransitionEntry& te = fb.transitions[0];
+        Object* obj = f.regs[code[pc + 1]].as_object();
+        if (te.from_shape && te.from_shape == obj->get_shape() &&
+            te.prototype == obj->get_prototype_raw() &&
+            te.proto_epoch == Object::proto_epoch() &&
+            obj->is_extensible() && !obj->has_any_descriptor_override() &&
+            obj->add_shape_property_in_place(acc, te.to_shape)) {
+            pc += 6;
+            DISPATCH();
+        }
+    }
+    [[clang::musttail]] return h_SetNamedTransitionSlow(f, pc, acc);
+}
+
+[[gnu::noinline]] Value h_SetNamedTransitionSlow(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
     const Value& receiver = f.regs[code[pc + 1]];
     Object* obj = receiver.as_object();
@@ -9367,28 +9643,6 @@ bool osr_try(Frame& f, uint32_t, const Value&) { f.osr_budget = INT32_MAX; retur
     return run_dispatch(f);
 }
 
-// Sets the first `used` registers of a 32-register bank to undefined, four at a time (the
-// bank is 256 bytes, so rounding up to a multiple of four never leaves it). The loop it
-// replaces indexed each pair from a counter -- shift, shift, store, add, extend,
-// compare, branch -- eight instructions per two registers; walking a pointer is four
-// per four.
-[[gnu::always_inline]] inline void init_register_bank(unsigned char* bank, unsigned used) {
-    if (used == 0) return;
-    const uint64_t undef_bits = std::bit_cast<uint64_t>(Value());
-#if defined(__SSE2__)
-    const __m128i pair = _mm_set1_epi64x(static_cast<long long>(undef_bits));
-    __m128i* p = reinterpret_cast<__m128i*>(bank);
-    __m128i* const end = p + ((used + 3) >> 2) * 2;
-    do {
-        _mm_store_si128(p, pair);
-        _mm_store_si128(p + 1, pair);
-        p += 2;
-    } while (p < end);
-#else
-    for (unsigned i = 0; i < used; i++) std::memcpy(bank + i * sizeof(Value), &undef_bits, sizeof undef_bits);
-#endif
-}
-
 // What run() does once its register bank exists, whichever kind that is. Always
 // inlined into the callers below so the hot one carries no extra call.
 //
@@ -9614,9 +9868,23 @@ template <bool Fast>
 
     if (__builtin_expect(chunk.jit_state != 1, 0) && chunk.jit_state != 2) jit::consider(chunk);
 
+    // Calls this activation makes may be stackless ones unless the baseline JIT is the one driving
+    // it (see "Stackless calls" above). The guard gives back any such frame still running if the
+    // activation is left by an exception that is not handled here.
+    frame.inline_ok = !chunk.jit && inline_calls_enabled();
+    struct InlineUnwind {
+        Frame& f;
+        ~InlineUnwind() { while (f.active) inline_frame_pop(*f.active); }
+    } inline_unwind{frame};
+
+    Frame* run_target = &frame;
     for (;;) {
       try {
-        return run_entry(frame);
+        const Value result = run_target == &frame ? run_entry(frame) : run_dispatch(*run_target);
+        // A handler that finds no catch clause covering an exception returns, whatever frame it
+        // was running; if that was a stackless one it is still listed as active, and the search
+        // continues below in the frames that called it.
+        if (LIKELY(frame.active == nullptr)) return result;
       } catch (const YieldException&) {
             throw;
       } catch (const GeneratorReturnException& gen_ret) {
@@ -9626,6 +9894,8 @@ template <bool Fast>
             // genreturn_pc -- Op::ReraiseGeneratorReturn re-throws once
             // finally is done, so an enclosing try's own handler picks it
             // up in turn.
+            while (frame.active) inline_frame_pop(*frame.active);
+            run_target = &frame;
             int32_t genreturn_pc = -1;
             uint32_t best_width = UINT32_MAX;
             if (chunk.handlers) for (const auto& h : *chunk.handlers) {
@@ -9648,25 +9918,38 @@ template <bool Fast>
       }
 
       // The same handler search CHECK_EXC does, for an exception that arrived
-      // as a C++ throw rather than through the context.
+      // as a C++ throw rather than through the context -- or that a stackless
+      // frame gave up on. It starts at the innermost frame this activation has
+      // running and works outward, giving each frame it passes back.
+      Frame* cur = frame.active ? frame.active : &frame;
       if (frame.ctx->has_exception()) {
-          int32_t handler_pc = -1;
-          uint32_t best_width = UINT32_MAX;
-          if (chunk.handlers) for (const auto& h : *chunk.handlers) {
-              if (frame.instr_pc >= h.start_pc && frame.instr_pc < h.end_pc) {
-                  uint32_t width = h.end_pc - h.start_pc;
-                  if (width < best_width) { best_width = width; handler_pc = static_cast<int32_t>(h.handler_pc); }
+          for (;;) {
+              int32_t handler_pc = -1;
+              uint32_t best_width = UINT32_MAX;
+              if (cur->chunk.handlers) for (const auto& h : *cur->chunk.handlers) {
+                  if (cur->instr_pc >= h.start_pc && cur->instr_pc < h.end_pc) {
+                      uint32_t width = h.end_pc - h.start_pc;
+                      if (width < best_width) { best_width = width; handler_pc = static_cast<int32_t>(h.handler_pc); }
+                  }
               }
+              if (handler_pc >= 0) {
+                  cur->acc = frame.ctx->get_exception();
+                  frame.ctx->clear_exception();
+                  cur->pc = static_cast<uint32_t>(handler_pc);
+                  run_target = cur;
+                  break;
+              }
+              if (cur == &frame) return Value();
+              Frame* const up = cur->caller;
+              inline_frame_pop(*cur);
+              cur = up;
           }
-          if (handler_pc < 0) return Value();
-          frame.acc = frame.ctx->get_exception();
-          frame.ctx->clear_exception();
-          frame.pc = static_cast<uint32_t>(handler_pc);
           continue;
       }
       // Only reachable if a catch above left no exception pending, which none
       // of them do; resume at the instruction that was executing.
-      frame.pc = frame.instr_pc;
+      cur->pc = cur->instr_pc;
+      run_target = cur;
     }
 }
 

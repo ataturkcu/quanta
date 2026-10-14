@@ -907,7 +907,16 @@ public:
     // Inline because the store handlers call it for every property a constructor
     // or a literal adds, and the work is a shape swap and one slot write; the
     // butterfly only grows (out of line) when the slot is not already there.
-    void add_shape_property_cached(const std::string&, const Value& value, Shape* to_shape) {
+    // The same without any call: false (and nothing touched) when the butterfly has no room.
+    bool add_shape_property_in_place(const Value& value, Shape* to_shape) {
+        const uint32_t new_count = to_shape->slot_count();
+        if (new_count > shape_capacity()) return false;
+        shape_ = to_shape;
+        *shape_slot_ptr(new_count - 1) = value;
+        if (used_as_prototype()) bump_proto_epoch();
+        return true;
+    }
+    [[gnu::always_inline]] void add_shape_property_cached(const std::string&, const Value& value, Shape* to_shape) {
         shape_ = to_shape;
         const uint32_t new_count = to_shape->slot_count();
         if (new_count > shape_capacity()) ensure_shape_capacity(new_count);
@@ -2005,8 +2014,11 @@ public:
     // Whether `.prototype` is simply the field (built, or built on first demand), so that a read
     // of it can skip get_property's name checks and the descriptor walk.
     bool has_plain_prototype() const { return prototype_ || prototype_pending_; }
+    // Whether a call must run in another realm than the caller's (a stackless call cannot).
+    bool runs_in_foreign_realm() const;
     Value constructor_prototype() const {
-        if (prototype_ || prototype_pending_) return Value(ensure_prototype());
+        if (prototype_) return Value(prototype_);
+        if (prototype_pending_) return Value(ensure_prototype());
         return get_property("prototype");
     }
 

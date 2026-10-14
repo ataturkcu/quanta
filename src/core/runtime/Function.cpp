@@ -1224,6 +1224,8 @@ inline Realm* Function::foreign_realm() const {
     return own != running ? own : nullptr;
 }
 
+bool Function::runs_in_foreign_realm() const { return foreign_realm() != nullptr; }
+
 Value Function::call_gated_in_realm(Realm* realm, Context& ctx, std::span<const Value> args,
                                     Value this_value) {
     RealmScope scope(realm);

@@ -76,6 +76,8 @@ RayTrace −20% from these; a 12-class construct loop −73%.
 
 **`new F()` through its own lean handler** (`h_ConstructLean`) and a `Function::construct` that is only the choice of road (the general body moved out so a plain `new` does not pay its frame).
 
+**Stackless interpreter calls.** `Call`/`CallResolved` of a plain compiled callee (no `this`/strictness switch, no env-mode, at most 32 registers, a chunk the JIT has refused) build the callee's `Frame` on a side arena and continue dispatching in it; `Return` pops it and dispatches the caller's next instruction, so the call costs no C++ frame, no `run_with_regs` set-up and no second dispatch loop. The pieces that make it safe: the arena's values are a GC root (`Collector::set_value_stack`), an exception unwinds stackless frames by searching each one's handlers from the call's pc, a C++ exception from a native lands in `run_with_regs`, which finds the innermost frame of its activation, and a frame the baseline JIT is stepping never starts one. Calls into another realm stay on the old path. Eligibility is decided once per chunk (`BytecodeChunk::inline_state`). −2.9% instructions on the suite (Richards −4%, DeltaBlue −5.6%, Earley −3.1%); `QUANTA_INLINE_CALLS=0` turns it off.
+
 **Smaller things:** register-bank initialisation, the argument copy (a plain loop; left alone the compiler turns it into a `memcpy` call that costs more than the copy for one to three arguments), frameless `Jump`/`JumpIf`/bitwise handlers and `read_*` helpers that compile to single loads, `h_BackEdgeDue` as the only place a loop back-edge reaches the collector or the JIT.
 
 Taken together: the benchmark suite is −13% against the start of this round (RayTrace −22%, Richards −14%, DeltaBlue −12%, Earley-Boyer −10%), and the real-world script went from 41.5 G to 34.8 G instructions (−16%; ~10% less wall-clock time on a quiet machine, RSS +1%). On the V8 benchmark scores the same build is ahead of the one it started from by Richards +22%, DeltaBlue +23%, RayTrace +50%, Earley-Boyer +9%; Splay and RegExp did not move (garbage collection and the regular-expression engine, not the interpreter).
@@ -87,7 +89,6 @@ Recorded so the next attempt starts from the result, not the idea.
 * **A memo of the first inline-cache entry in the `FeedbackSlot`** (raw shape word + slot index, so a hit is one compare). Saves about ten instructions per own-property hit but the suite moved by 0.4%; not worth a second copy of cache state to invalidate.
 * **A leaner `call_gated` that only skipped checks** without removing the Context traffic: same instruction count, the compiler turned the conditionals into flag juggling.
 * **GC growth-factor knob, call-share gate:** no measurable change in instructions.
-* **Stackless interpreter calls** (a call handler that pushes a frame on a side stack and continues dispatch, `Return` popping it). Estimated before building: the plain-callee calls that would qualify (loop-free functions, which the JIT declines) are ~60% of calls, and the saving is ~130 of ~300 instructions per call, so ~3.5% overall for a change that touches exception unwinding, the GC's view of registers, OSR and the JIT's stepping. Not done; if the call path is revisited this is the shape of the answer.
 
 ## Where the rest is
 

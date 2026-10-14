@@ -161,6 +161,10 @@ public:
     // malloc'd std::vector storage that the conservative stack scan cannot
     // reach. A vector registered here is traced (its current data pointer is
     // re-read each collection, so reallocation during push_back is safe).
+    // The interpreter's side stack of stackless-call registers (see VM::InlineArena): the
+    // Values in [base, *top) are exact roots for as long as the range is registered. One range
+    // per thread; pass nulls to unregister.
+    static void set_value_stack(Value* base, Value* const* top);
     static void push_value_vector(const std::vector<Value>* vec);
     static void pop_value_vector(const std::vector<Value>* vec);
 
