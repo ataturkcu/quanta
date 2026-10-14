@@ -962,8 +962,9 @@ struct BytecodeChunk {
     mutable std::unique_ptr<JitCode, JitCodeDeleter> jit;
     mutable uint16_t jit_hotness = 0;
     mutable uint8_t jit_state = 0;
-    // Whether a call of this chunk may run stackless (Interpreter.cpp): 0 not decided, 1 yes,
-    // 2 never. Decided once jit_state is, from properties of the chunk that do not change.
+    // Whether a call of this chunk may run stackless (Interpreter.cpp): 0 not decided, 1 never,
+    // otherwise flag bits that say yes and what the per-call test still has to look at. Decided
+    // once jit_state is, from properties of the declaration site that do not change.
     mutable uint8_t inline_state = 0;
 
     // A function whose whole body is `return <constant>`, `return this` or

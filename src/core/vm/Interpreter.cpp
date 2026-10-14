@@ -2268,13 +2268,12 @@ struct ArenaOwner {
     }
 };
 
-bool inline_calls_enabled() {
-    static const bool enabled = [] {
-        const char* e = std::getenv("QUANTA_INLINE_CALLS");
-        return !(e && e[0] == '0');
-    }();
-    return enabled;
-}
+// Read once at load, not behind a function-local static: that one is a guard test per call.
+const bool g_inline_calls_enabled = [] {
+    const char* e = std::getenv("QUANTA_INLINE_CALLS");
+    return !(e && e[0] == '0');
+}();
+inline bool inline_calls_enabled() { return g_inline_calls_enabled; }
 
 // Words one frame reserves: `this` and a pad word (so the registers start 16-aligned), then the
 // registers rounded up to the four init_register_bank writes at a time.
@@ -2310,33 +2309,72 @@ constexpr uint32_t inline_frame_words(uint32_t regs) { return 2 + ((regs + 3) & 
     CallStack::instance().pop_frame_unchecked();
 }
 
+// What the chunk's verdict (BytecodeChunk::inline_state) says. Everything it is made from is
+// fixed by the declaration site, so closures sharing the chunk agree: 0 not decided, 1 never,
+// otherwise kInlineOk plus the two bits the per-call test needs.
+constexpr uint8_t kInlineNever = 1;
+constexpr uint8_t kInlineOk = 2;
+constexpr uint8_t kInlineStrict = 4;      // the callee runs strict
+constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (it boxes a primitive)
+
+[[gnu::noinline]] uint8_t inline_classify(const FunctionExecutable& exe, const BytecodeChunk& chunk, Function* fn) {
+    // jit_state 0 is "not decided yet": ask again next call. Once the JIT has refused the chunk
+    // its shape is final, so the verdict is kept.
+    if (chunk.jit_state == 0) return 0;
+    const bool strict = fn->is_strict() || exe.fast_strict;
+    uint8_t v = kInlineNever;
+    if (chunk.jit_state == 2 && !chunk.env_mode && chunk.register_count <= kInlineMaxRegs && !fn->is_arrow() &&
+        !exe.fast_uses_super && !exe.fast_leaf) {
+        v = kInlineOk | (strict ? kInlineStrict : 0) | (exe.fast_uses_this ? kInlineWantsThis : 0);
+    }
+    chunk.inline_state = v;
+    return v;
+}
+
+// The caches an instance of a shared chunk keeps for itself -- see run_with_regs. Out of line:
+// only a chunk that reads a global/closure name or a private name needs them.
+[[gnu::noinline]] void inline_instance_caches(const BytecodeChunk& chunk, Function* fn,
+                                              BytecodeChunk::LookupCacheEntry*& lookup,
+                                              PrivateFeedback*& priv) {
+    if (chunk.uses_lookup_cache) {
+        auto& instance_cache = fn->instance_lookup_cache();
+        if (instance_cache.size() < chunk.names.size()) instance_cache.resize(chunk.names.size());
+        lookup = instance_cache.data();
+    }
+    const size_t private_count = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.size() : 0;
+    if (private_count > 0) {
+        auto& instance_pf = fn->instance_private_feedback();
+        if (instance_pf.size() < private_count) instance_pf.resize(private_count);
+        priv = instance_pf.data();
+    }
+}
+
 // Starts a stackless call of `fn` from `f` if everything allows it; true with the callee's
 // frame in `out` (the caller has only to dispatch it), false with nothing touched.
 [[gnu::always_inline]] inline bool inline_call_enter(Frame& f, Function* fn, const Value* argv, uint32_t argc,
                                                        const Value& this_value, uint32_t return_pc, Frame*& out) {
-    if (!f.inline_ok) return false;
-    Context& ctx = *f.ctx;
     const FunctionExecutable& exe = *fn->get_executable().get();
-    const bool callee_strict = fn->is_strict() || exe.fast_strict;
     const BytecodeChunk& chunk = *exe.bytecode_chunk;
-    if (UNLIKELY(chunk.inline_state != 1)) {
-        // jit_state 0 is "not decided yet": ask again next call. Once the JIT has refused the
-        // chunk its shape is final, so the verdict is cached.
-        if (chunk.jit_state == 0) return false;
-        chunk.inline_state = (chunk.jit_state == 2 && !chunk.env_mode && chunk.register_count <= kInlineMaxRegs &&
-                              !exe.fast_uses_super && !exe.fast_leaf) ? 1 : 2;
-        if (chunk.inline_state != 1) return false;
+    uint8_t verdict = chunk.inline_state;
+    if (UNLIKELY(verdict < kInlineOk)) {
+        if (verdict == kInlineNever) return false;
+        verdict = inline_classify(exe, chunk, fn);
+        if (verdict < kInlineOk) return false;
     }
-    if (UNLIKELY(fn->is_arrow() || ctx.this_needs_super() || ctx.is_strict_mode() != callee_strict ||
-                 (exe.fast_uses_this && !callee_strict && !this_value.is_object() && !this_value.is_function()))) {
+    Context& ctx = *f.ctx;
+    // A call that changes the strictness, needs a boxed `this`, or runs in another realm is the
+    // general path's. (this_needs_super: an arrow's super lookup, which the callee would not see.)
+    if (UNLIKELY(ctx.this_needs_super() || ctx.is_strict_mode() != ((verdict & kInlineStrict) != 0) ||
+                 ((verdict & (kInlineWantsThis | kInlineStrict)) == kInlineWantsThis && !this_value.is_object() &&
+                  !this_value.is_function()) ||
+                 exe.owner_realm() != g_current_realm)) {
         return false;
     }
-    if (UNLIKELY(g_track_positions || Engine::multi_engine() || fn->runs_in_foreign_realm())) return false;
     InlineArena& arena = g_arena;
-    CallStack& stack = CallStack::instance();
     if (UNLIKELY(!arena.values)) {
-        if (!inline_calls_enabled() || !inline_arena_init()) return false;
+        if (!inline_arena_init()) return false;
     }
+    CallStack& stack = CallStack::instance();
     const uint32_t nregs = std::max<uint32_t>(chunk.register_count, chunk.parameter_count);
     const uint32_t words = inline_frame_words(nregs);
     if (UNLIKELY(stack.depth() + 1 >= CallStack::MAX_STACK_DEPTH || arena.top + words > arena.limit)) return false;
@@ -2347,20 +2385,10 @@ constexpr uint32_t inline_frame_words(uint32_t regs) { return 2 + ((regs + 3) & 
     if (!outer_env) outer_env = ctx.get_lexical_environment();
     if (outer_env && !exe.fast_no_closures) outer_env->mark_escaped();
 
-    // The caches an instance of a shared chunk keeps for itself -- see run_with_regs.
     BytecodeChunk::LookupCacheEntry* lookup_cache_data = chunk.lookup_cache.data();
-    if (chunk.uses_lookup_cache) {
-        auto& instance_cache = fn->instance_lookup_cache();
-        if (instance_cache.size() < chunk.names.size()) instance_cache.resize(chunk.names.size());
-        lookup_cache_data = instance_cache.data();
-    }
-    const size_t private_count = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.size() : 0;
     PrivateFeedback* private_feedback_data = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.data() : nullptr;
-    if (private_count > 0) {
-        auto& instance_pf = fn->instance_private_feedback();
-        if (instance_pf.size() < private_count) instance_pf.resize(private_count);
-        private_feedback_data = instance_pf.data();
-    }
+    if (UNLIKELY(chunk.uses_lookup_cache || private_feedback_data))
+        inline_instance_caches(chunk, fn, lookup_cache_data, private_feedback_data);
 
     Value* bank = arena.top;
     Value* regs = bank + 2;
@@ -6296,7 +6324,11 @@ Value h_gen_CallResolved(Frame& f, uint32_t pc, Value acc) {
 // operand decode, two exception tests -- when all that has to survive it is the
 // frame and the pc. A callee that is not a function (a Proxy, a non-callable)
 // tail-calls the generated handler untouched.
-Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
+Value h_CallInline(Frame& f, uint32_t pc, Value acc);
+
+// The stackless attempt (h_CallInline) is its own function: folded in here it costs this one a
+// longer prologue on every call, including the ones that never qualify.
+Value h_CallPlain(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
     const Value& callee = f.regs[code[pc + 1]];
     if (LIKELY(callee.is_function())) {
@@ -6304,11 +6336,6 @@ Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
         f.instr_pc = pc;
         Context& ctx = *f.ctx;
         const std::span<const Value> call_args(f.regs + code[pc + 2], code[pc + 3]);
-        if (LIKELY(fn->fast_callable())) {
-            Frame* callee_frame;
-            if (inline_call_enter(f, fn, call_args.data(), static_cast<uint32_t>(call_args.size()), Value(), pc + 6, callee_frame))
-                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
-        }
         acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, Value())
                                           : fn->call_register_args(ctx, call_args, Value());
         if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
@@ -6319,7 +6346,9 @@ Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
     [[clang::musttail]] return h_gen_Call(f, pc, acc);
 }
 
-Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
+Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc);
+
+Value h_CallResolvedPlain(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
     const Value& callee = f.regs[code[pc + 1]];
     if (LIKELY(callee.is_function())) {
@@ -6328,11 +6357,6 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
         Context& ctx = *f.ctx;
         const std::span<const Value> call_args(f.regs + code[pc + 3], code[pc + 4]);
         const Value& receiver = f.regs[code[pc + 2]];
-        if (LIKELY(fn->fast_callable())) {
-            Frame* callee_frame;
-            if (inline_call_enter(f, fn, call_args.data(), static_cast<uint32_t>(call_args.size()), receiver, pc + 7, callee_frame))
-                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
-        }
         acc = LIKELY(fn->fast_callable()) ? fn->call_fast_gate(ctx, call_args, receiver)
                                           : fn->call_register_args(ctx, call_args, receiver);
         if (UNLIKELY(ctx.has_exception())) [[clang::musttail]] return h_ExceptionAt(f, pc, acc);
@@ -6341,6 +6365,46 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
         DISPATCH();
     }
     [[clang::musttail]] return h_gen_CallResolved(f, pc, acc);
+}
+
+Value h_CallLean(Frame& f, uint32_t pc, Value acc) {
+    if (f.inline_ok) [[clang::musttail]] return h_CallInline(f, pc, acc);
+    [[clang::musttail]] return h_CallPlain(f, pc, acc);
+}
+
+Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
+    if (f.inline_ok) [[clang::musttail]] return h_CallResolvedInline(f, pc, acc);
+    [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
+}
+
+Value h_CallInline(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& callee = f.regs[code[pc + 1]];
+    if (LIKELY(callee.is_function())) {
+        Function* fn = callee.as_function();
+        if (LIKELY(fn->fast_callable())) {
+            f.instr_pc = pc;
+            Frame* callee_frame;
+            if (inline_call_enter(f, fn, f.regs + code[pc + 2], code[pc + 3], Value(), pc + 6, callee_frame))
+                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+        }
+    }
+    [[clang::musttail]] return h_CallPlain(f, pc, acc);
+}
+
+Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc) {
+    const uint8_t* code = f.code;
+    const Value& callee = f.regs[code[pc + 1]];
+    if (LIKELY(callee.is_function())) {
+        Function* fn = callee.as_function();
+        if (LIKELY(fn->fast_callable())) {
+            f.instr_pc = pc;
+            Frame* callee_frame;
+            if (inline_call_enter(f, fn, f.regs + code[pc + 3], code[pc + 4], f.regs[code[pc + 2]], pc + 7, callee_frame))
+                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+        }
+    }
+    [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
 }
 
 Value h_gen_Construct(Frame& f, uint32_t pc, Value acc);
@@ -9871,10 +9935,10 @@ template <bool Fast>
     // Calls this activation makes may be stackless ones unless the baseline JIT is the one driving
     // it (see "Stackless calls" above). The guard gives back any such frame still running if the
     // activation is left by an exception that is not handled here.
-    frame.inline_ok = !chunk.jit && inline_calls_enabled();
+    frame.inline_ok = !chunk.jit && inline_calls_enabled() && !g_track_positions && !Engine::multi_engine();
     struct InlineUnwind {
         Frame& f;
-        ~InlineUnwind() { while (f.active) inline_frame_pop(*f.active); }
+        ~InlineUnwind() { if (UNLIKELY(f.active != nullptr)) while (f.active) inline_frame_pop(*f.active); }
     } inline_unwind{frame};
 
     Frame* run_target = &frame;
