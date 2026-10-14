@@ -6377,32 +6377,45 @@ Value h_CallResolvedLean(Frame& f, uint32_t pc, Value acc) {
     [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
 }
 
-Value h_CallInline(Frame& f, uint32_t pc, Value acc) {
+// The two stackless entries are a cheap screen and the heavy part behind it: the heavy part saves
+// six registers on the way in, and a call the chunk's verdict has already refused (a third of
+// them in a closure-heavy program) should not pay that to be sent on to the ordinary path.
+Value h_CallInlineGo(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
-    const Value& callee = f.regs[code[pc + 1]];
+    Function* fn = f.regs[code[pc + 1]].as_function();
+    f.instr_pc = pc;
+    Frame* callee_frame;
+    if (inline_call_enter(f, fn, f.regs + code[pc + 2], code[pc + 3], Value(), pc + 6, callee_frame))
+        [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+    [[clang::musttail]] return h_CallPlain(f, pc, acc);
+}
+
+Value h_CallInline(Frame& f, uint32_t pc, Value acc) {
+    const Value& callee = f.regs[f.code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable())) {
-            f.instr_pc = pc;
-            Frame* callee_frame;
-            if (inline_call_enter(f, fn, f.regs + code[pc + 2], code[pc + 3], Value(), pc + 6, callee_frame))
-                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
-        }
+        if (LIKELY(fn->fast_callable()) && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+            [[clang::musttail]] return h_CallInlineGo(f, pc, acc);
     }
     [[clang::musttail]] return h_CallPlain(f, pc, acc);
 }
 
-Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc) {
+Value h_CallResolvedInlineGo(Frame& f, uint32_t pc, Value acc) {
     const uint8_t* code = f.code;
-    const Value& callee = f.regs[code[pc + 1]];
+    Function* fn = f.regs[code[pc + 1]].as_function();
+    f.instr_pc = pc;
+    Frame* callee_frame;
+    if (inline_call_enter(f, fn, f.regs + code[pc + 3], code[pc + 4], f.regs[code[pc + 2]], pc + 7, callee_frame))
+        [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
+    [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
+}
+
+Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc) {
+    const Value& callee = f.regs[f.code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable())) {
-            f.instr_pc = pc;
-            Frame* callee_frame;
-            if (inline_call_enter(f, fn, f.regs + code[pc + 3], code[pc + 4], f.regs[code[pc + 2]], pc + 7, callee_frame))
-                [[clang::musttail]] return kHandlers[callee_frame->code[0]](*callee_frame, 0, Value());
-        }
+        if (LIKELY(fn->fast_callable()) && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+            [[clang::musttail]] return h_CallResolvedInlineGo(f, pc, acc);
     }
     [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
 }

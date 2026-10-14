@@ -6812,6 +6812,71 @@ int BytecodeCompiler::plain_local_register(const std::string& name) const {
     return reg;
 }
 
+int BytecodeCompiler::borrow_this_register() {
+    // The cache register is outside the temp pool and `this` cannot change in a frame, so it
+    // is as good as a local nobody assigns. The first read fills it, as it would anyway.
+    if (this_cache_reg_ < 0 || with_depth_ > 0) return -1;
+    if (!this_cache_valid_) {
+        emit(Op::LdaThis);
+        emit(Op::Star);
+        emit_u8(static_cast<uint8_t>(this_cache_reg_));
+        this_cache_valid_ = true;
+    }
+    return this_cache_reg_;
+}
+
+int BytecodeCompiler::borrow_object_register(const ASTNode* obj, const std::vector<const ASTNode*>& later) {
+    if (!obj || obj->get_type() != ASTNode::Type::IDENTIFIER) return -1;
+    const std::string& name = static_cast<const Identifier*>(obj)->get_name();
+    if (name == "this") return borrow_this_register();
+    if (with_depth_ > 0) return -1;
+    const int reg = plain_local_register(name);
+    if (reg < 0) return -1;
+    const std::unordered_set<std::string> candidates{name};
+    std::unordered_set<std::string> assigned;
+    for (const ASTNode* n : later) collect_assigned_identifiers(n, candidates, assigned);
+    return assigned.empty() ? reg : -1;
+}
+
+// Whether anything in tape entries [begin, end) stores to the local `name`: an assignment or an
+// update of it, or an embedded tree that might. A register local can be written by nothing else
+// (a closure that could would have put it in the environment).
+bool BytecodeCompiler::tape_assigns_name(TapeView tape, size_t begin, size_t end, const std::string& name) const {
+    const std::unordered_set<std::string> candidates{name};
+    std::unordered_set<std::string> assigned;
+    for (size_t i = begin; i < end && i < tape.size(); i++) {
+        const TapeEntry& e = tape[i];
+        switch (e.tag) {
+            case TapeTag::Assign:
+                if (NamePool::text(e.name_id) == name) return true;
+                break;
+            case TapeTag::Update:
+                // The operand entry follows; being conservative about which name it is costs
+                // only the optimisation.
+                if (i + 1 < tape.size() && tape[i + 1].tag == TapeTag::Identifier &&
+                    NamePool::text(tape[i + 1].name_id) == name) return true;
+                break;
+            case TapeTag::Node:
+                if (tape_embedded_) collect_assigned_identifiers((*tape_embedded_)[e.name_id].get(), candidates, assigned);
+                break;
+            default:
+                break;
+        }
+    }
+    return !assigned.empty();
+}
+
+int BytecodeCompiler::borrow_tape_object_register(TapeView tape, size_t obj_idx, size_t later_begin, size_t later_end) {
+    const TapeEntry& obj_e = tape[obj_idx];
+    if (obj_e.tag != TapeTag::Identifier) return -1;
+    const std::string& name = NamePool::text(obj_e.name_id);
+    if (name == "this") return borrow_this_register();
+    if (with_depth_ > 0) return -1;
+    const int reg = plain_local_register(name);
+    if (reg < 0) return -1;
+    return tape_assigns_name(tape, later_begin, later_end, name) ? -1 : reg;
+}
+
 bool BytecodeCompiler::leaves_locals_untouched(const ASTNode* expr) const {
     if (!expr) return false;
     switch (expr->get_type()) {
@@ -10695,8 +10760,10 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
             // `u.a` inside a loop pays it on every iteration.
             int borrowed_reg = -1;
             if (mem->get_object()->get_type() == ASTNode::Type::IDENTIFIER) {
-                borrowed_reg = plain_local_register(
-                    static_cast<const Identifier*>(mem->get_object())->get_name());
+                const auto& oname = static_cast<const Identifier*>(mem->get_object())->get_name();
+                borrowed_reg = oname == "this"
+                    ? borrow_object_register(mem->get_object(), {})
+                    : plain_local_register(oname);
             }
             int obj_reg = borrowed_reg;
             if (obj_reg < 0) {
@@ -11673,11 +11740,18 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
             }
             if (!priv && !member_is_supported(mem)) return false;
 
-            if (!compile_expression(mem->get_object())) return false;
-            int obj_reg = alloc_temp();
-            if (failed_) return false;
-            emit(Op::Star);
-            emit_u8(static_cast<uint8_t>(obj_reg));
+            // What runs between reading the object and storing into it: the right side and,
+            // for a computed target, its key.
+            int obj_reg = borrow_object_register(mem->get_object(),
+                                                 {expr->get_right(), mem->is_computed() ? mem->get_property() : nullptr});
+            const bool obj_borrowed = obj_reg >= 0;
+            if (!obj_borrowed) {
+                if (!compile_expression(mem->get_object())) return false;
+                obj_reg = alloc_temp();
+                if (failed_) return false;
+                emit(Op::Star);
+                emit_u8(static_cast<uint8_t>(obj_reg));
+            }
 
             uint16_t name_idx = 0;
             int key_reg = -1;
@@ -11737,7 +11811,7 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
                                static_cast<uint8_t>(key_reg), alloc_keyed_feedback());
                 free_temp(key_reg);
             }
-            free_temp(obj_reg);
+            if (!obj_borrowed) free_temp(obj_reg);
             return !failed_;
         }
 
@@ -11965,15 +12039,30 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
                 // super.m(...) calls the method found on the super base, but with
                 // the current `this` as receiver, so the two differ here where
                 // every other form uses one object for both.
-                if (super_mem) {
-                    emit(Op::LdaThis);
-                } else if (!compile_expression(mem_obj)) {
-                    return false;
+                // The receiver is read once and used by the method lookup and again by the
+                // call itself, with the arguments evaluated in between: a register local the
+                // arguments leave alone (or `this`) is its own receiver operand, which saves
+                // the copy into a temporary on nearly every method call.
+                const int temp_base = next_register_;
+                int obj_reg = -1;
+                if (!super_mem && !mem_optional && !call->is_optional() && !call->is_tagged_template()) {
+                    std::vector<const ASTNode*> later;
+                    for (const auto& arg : call_args) later.push_back(arg.get());
+                    if (mem_computed) later.push_back(mem_prop);
+                    obj_reg = borrow_object_register(mem_obj, later);
                 }
-                int obj_reg = alloc_temp();
-                if (failed_) return false;
-                emit(Op::Star);
-                emit_u8(static_cast<uint8_t>(obj_reg));
+                const bool obj_borrowed = obj_reg >= 0;
+                if (!obj_borrowed) {
+                    if (super_mem) {
+                        emit(Op::LdaThis);
+                    } else if (!compile_expression(mem_obj)) {
+                        return false;
+                    }
+                    obj_reg = alloc_temp();
+                    if (failed_) return false;
+                    emit(Op::Star);
+                    emit_u8(static_cast<uint8_t>(obj_reg));
+                }
                 if (mem_optional) {
                     // a?.b(...): receiver still in the accumulator after Star.
                     chain_shortcircuit_jumps_->push_back(emit_jump(Op::JumpIfNullish));
@@ -12023,14 +12112,14 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
                             args_reg = emit_spread_array(call_args);
                         }
                     }
-                    if (args_reg < 0) { free_temp(obj_reg); return false; }
+                    if (args_reg < 0) { free_temp(temp_base); return false; }
                     emit(Op::CallSpread);
                     emit_u8(static_cast<uint8_t>(func_reg));
                     emit_u8(static_cast<uint8_t>(obj_reg));
                     emit_u8(static_cast<uint8_t>(args_reg));
                     emit_u16(add_name(method_name));
                     free_temp(args_reg);
-                    free_temp(obj_reg);
+                    free_temp(temp_base);
                     return !failed_;
                 }
 
@@ -12056,7 +12145,7 @@ bool BytecodeCompiler::compile_expression(const ASTNode* node, bool discard) {
                 emit_u8(static_cast<uint8_t>(args_start));
                 emit_u8(argc);
                 emit_u16(add_name(method_name));
-                free_temp(obj_reg);
+                free_temp(temp_base);
                 return !failed_;
             }
 
@@ -12841,7 +12930,7 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                 const std::string& lname = NamePool::text(left_e.name_id);
                 int left_reg = lexical_out_of_scope(lname) ? -1 : plain_local_register(lname);
                 size_t right_idx = left_idx + left_e.span;
-                if (left_reg >= 0 && tape_cannot_write_registers(tape, right_idx)) {
+                if (left_reg >= 0 && !tape_assigns_name(tape, right_idx, index + e.span, lname)) {
                     size_t after_right = compile_tape_expr(tape, right_idx, false);
                     if (after_right == 0) return 0;
                     emit(vm_op);
@@ -12872,7 +12961,9 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
             const TapeEntry& obj_e = tape[obj_idx];
             int borrowed_reg = -1;
             if (obj_e.tag == TapeTag::Identifier) {
-                borrowed_reg = plain_local_register(NamePool::text(obj_e.name_id));
+                // Nothing runs between reading the object and the lookup for a named property;
+                // a computed key does, and may assign the local.
+                borrowed_reg = borrow_tape_object_register(tape, obj_idx, obj_idx + obj_e.span, index + e.span);
             }
             int obj_reg = borrowed_reg;
             size_t after_obj;
@@ -12947,11 +13038,19 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                 };
                 const bool is_call_form = !computed && prop == "call";
                 const bool is_apply_form = !computed && prop == "apply" && e.call_argc == 2;
-                if (compile_tape_expr(tape, obj_idx, false) == 0) return 0;
-                int obj_reg = alloc_temp();
-                if (failed_) return 0;
-                emit(Op::Star);
-                emit_u8(static_cast<uint8_t>(obj_reg));
+                // The receiver is read once and used by the method lookup and again by the call
+                // itself with the arguments evaluated in between: a register local they leave
+                // alone (or `this`) is its own receiver operand, which saves a copy into a
+                // temporary on nearly every method call.
+                const int temp_base = next_register_;
+                int obj_reg = borrow_tape_object_register(tape, obj_idx, after_obj, index + e.span);
+                if (obj_reg < 0) {
+                    if (compile_tape_expr(tape, obj_idx, false) == 0) return 0;
+                    obj_reg = alloc_temp();
+                    if (failed_) return 0;
+                    emit(Op::Star);
+                    emit_u8(static_cast<uint8_t>(obj_reg));
+                }
                 if (is_call_form || is_apply_form) {
                     int args_start = next_register_;
                     if (!compile_args()) return 0;
@@ -12968,7 +13067,7 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                     }
                     if (fb_idx <= 0xFFFFu) emit_u16(static_cast<uint16_t>(fb_idx));
                     else emit_u32(fb_idx);
-                    free_temp(obj_reg);
+                    free_temp(temp_base);
                     return failed_ ? 0 : index + e.span;
                 }
                 if (!computed) {
@@ -12991,7 +13090,7 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                 emit_u8(static_cast<uint8_t>(args_start));
                 emit_u8(e.call_argc);
                 emit_u16(add_name(computed ? std::string("<computed>") : prop));
-                free_temp(obj_reg);
+                free_temp(temp_base);
                 return failed_ ? 0 : index + e.span;
             }
             std::string callee_name;
@@ -13191,12 +13290,20 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                 if (!compile_expression(&expr, discard)) return 0;
                 return failed_ ? 0 : index + e.span;
             }
-            size_t after_obj = compile_tape_expr(tape, obj_idx, false);
-            if (after_obj == 0) return 0;
-            int obj_reg = alloc_temp();
-            if (failed_) return 0;
-            emit(Op::Star);
-            emit_u8(static_cast<uint8_t>(obj_reg));
+            const int temp_base = next_register_;
+            // Between reading the object and storing into it run the key and the right side.
+            int obj_reg = borrow_tape_object_register(tape, obj_idx, obj_idx + tape[obj_idx].span, index + e.span);
+            size_t after_obj;
+            if (obj_reg >= 0) {
+                after_obj = obj_idx + tape[obj_idx].span;
+            } else {
+                after_obj = compile_tape_expr(tape, obj_idx, false);
+                if (after_obj == 0) return 0;
+                obj_reg = alloc_temp();
+                if (failed_) return 0;
+                emit(Op::Star);
+                emit_u8(static_cast<uint8_t>(obj_reg));
+            }
             uint16_t name_idx = 0;
             int key_reg = -1;
             size_t rhs_idx = after_obj;
@@ -13219,7 +13326,7 @@ size_t BytecodeCompiler::compile_tape_expr(TapeView tape, size_t index, bool dis
                                static_cast<uint8_t>(key_reg), alloc_keyed_feedback());
                 free_temp(key_reg);
             }
-            free_temp(obj_reg);
+            free_temp(temp_base);
             return failed_ ? 0 : index + e.span;
         }
         case TapeTag::Constant: {
