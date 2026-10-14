@@ -5003,6 +5003,27 @@ const std::vector<const std::string*>& loop_env_keys_for(const BytecodeChunk& ch
     return b.loop_env_keys[idx];
 }
 
+// Binds a loop or block scope's variables into the environment just pushed for it, by index and
+// with no lookups, when it has room and the names are distinct (the case for nearly every
+// scope). `carried`, when given, holds the values a `for` header's variables take from the
+// previous iteration. False means the caller binds them one by one.
+static bool seed_scope_bindings(Environment* env, const std::vector<BytecodeChunk::LoopEnvVar>& vars,
+                                const std::vector<const std::string*>& keys, const Value* carried) {
+    if (!env->fresh_with_room(vars.size())) return false;
+    for (size_t i = 0; i < keys.size(); i++)
+        for (size_t j = i + 1; j < keys.size(); j++)
+            if (keys[i] == keys[j]) return false;
+    for (size_t i = 0; i < vars.size(); i++) {
+        const auto& v = vars[i];
+        Environment::BindingSlot slot = v.is_lexical ? Environment::BindingSlot{Value(), !v.is_const, false, false}
+                                                     : Environment::BindingSlot{Value(), true, true, false};
+        if (v.is_lexical && v.is_const) slot.const_binding = true;
+        if (carried && v.copy_forward) { slot.value = carried[i]; slot.initialized = true; }
+        env->seed_binding(i, keys[i], slot);
+    }
+    return true;
+}
+
 Value h_gen_EnterLoopEnv(Frame& f, uint32_t pc, Value acc) {
     const BytecodeChunk& chunk = f.chunk;
     Context& ctx = *f.ctx;
@@ -5018,6 +5039,7 @@ Value h_gen_EnterLoopEnv(Frame& f, uint32_t pc, Value acc) {
                 Environment* env = frame_lexical_env(f);
                 const auto& vars = chunk.env->loop_envs[idx];
                 const auto& keys = loop_env_keys_for(chunk, idx);
+                if (seed_scope_bindings(env, vars, keys, nullptr)) break;
                 for (size_t i = 0; i < vars.size(); i++) {
                     const auto& v = vars[i];
                     if (v.is_lexical) {
@@ -5046,14 +5068,20 @@ Value h_gen_AdvanceLoopEnv(Frame& f, uint32_t pc, Value acc) {
                 pc += 2;
                 const auto& vars = chunk.env->loop_envs[idx];
                 const auto& keys = loop_env_keys_for(chunk, idx);
-                std::vector<Value> carried(vars.size());
+                // On the stack for the usual few variables: a heap vector per iteration was
+                // the dearest part of advancing a `for (let ...)` loop that makes closures.
+                Value carried_small[8];
+                std::vector<Value> carried_large;
+                Value* carried_ptr = carried_small;
+                if (vars.size() > 8) { carried_large.resize(vars.size()); carried_ptr = carried_large.data(); }
                 Environment* old_env = frame_lexical_env(f);
                 for (size_t i = 0; i < vars.size(); i++) {
-                    if (vars[i].copy_forward) carried[i] = old_env->get_binding_direct_interned(keys[i], &ctx);
+                    if (vars[i].copy_forward) carried_ptr[i] = old_env->get_binding_direct_interned(keys[i], &ctx);
                 }
                 frame_pop_block_scope(f);
                 frame_push_block_scope(f);
                 Environment* new_env = frame_lexical_env(f);
+                if (seed_scope_bindings(new_env, vars, keys, carried_ptr)) break;
                 for (size_t i = 0; i < vars.size(); i++) {
                     const auto& v = vars[i];
                     if (v.is_lexical) {
@@ -5061,7 +5089,7 @@ Value h_gen_AdvanceLoopEnv(Frame& f, uint32_t pc, Value acc) {
                         if (v.is_const) new_env->mark_const_binding(v.name);
                     }
                     else new_env->create_binding_interned(keys[i], Value(), true);
-                    if (v.copy_forward) new_env->initialize_binding_interned(keys[i], carried[i]);
+                    if (v.copy_forward) new_env->initialize_binding_interned(keys[i], carried_ptr[i]);
                 }
                 break;
             }
