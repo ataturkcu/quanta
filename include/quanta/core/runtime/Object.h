@@ -440,6 +440,26 @@ public:
     // live in a property or traced field (the existing pin-property
     // discipline).
     void trace(Visitor& v);
+    // Whether trace() is nothing but trace_default(): true of everything except the types
+    // that hold references of their own (functions, typed arrays, hosts, collections,
+    // promises, proxies...). The mark loop uses it to take the inlined walk below.
+    bool traces_by_default() const {
+        switch (get_type()) {
+            case ObjectType::Function: case ObjectType::TypedArray: case ObjectType::Custom:
+            case ObjectType::Map: case ObjectType::Set: case ObjectType::WeakMap:
+            case ObjectType::WeakSet: case ObjectType::WeakRef: case ObjectType::FinalizationRegistry:
+            case ObjectType::DataView: case ObjectType::Promise: case ObjectType::Proxy:
+                return false;
+            default:
+                return true;
+        }
+    }
+    // trace_default() for a collector that wants its visits inlined: V supplies edge_object
+    // and edge_value, which the mark loop makes plain member functions of a final class
+    // instead of virtual calls. Defined in ObjectTrace.h. The rare storage (sparse
+    // overflow, private fields, internal slots, descriptors) stays behind trace_extras().
+    template <class V> void trace_fast(V& v);
+    void trace_extras(Visitor& v);
 
     // Where this object's traced storage lives, for the collector's mark
     // pipeline to request the cache line ahead of time (Collector.cpp,

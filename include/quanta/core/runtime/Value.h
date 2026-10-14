@@ -253,6 +253,16 @@ public:
     [[nodiscard]] inline bool has_tag_(uint64_t tag) const noexcept {
         return (bits_ >> 48) == ((QUIET_NAN | tag) >> 48);
     }
+    // What kind of cell, if any, this value points at, for the collector's mark loop: one range
+    // test dismisses every number (the common value in a data-heavy heap), and a small table
+    // classifies the rest. 0 none, 1 object (or function), 2 string, 3 symbol, 4 bigint.
+    [[nodiscard]] inline unsigned gc_edge_kind() const noexcept {
+        const uint32_t d = static_cast<uint32_t>(bits_ >> 48) - static_cast<uint32_t>((QUIET_NAN | TAG_STRING) >> 48);
+        // String, Symbol, BigInt, Object are consecutive tags; NaN sits between them and Function.
+        if (d > 5u || d == 4u) return 0;
+        constexpr uint8_t kKind[6] = {2, 3, 4, 1, 0, 1};
+        return kKind[d];
+    }
     [[nodiscard]] inline bool is_undefined() const noexcept { return has_tag_(TAG_UNDEFINED); }
     [[nodiscard]] inline bool is_null() const noexcept { return has_tag_(TAG_NULL); }
     // False and true are adjacent tags (2 and 3), so one compare after clearing

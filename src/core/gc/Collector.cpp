@@ -27,6 +27,7 @@
 #include "quanta/core/runtime/MapSet.h"
 #include "quanta/core/runtime/Promise.h"
 #include "quanta/core/runtime/ProxyReflect.h"
+#include "quanta/core/runtime/ObjectTrace.h"
 #include "quanta/core/runtime/String.h"
 #include "quanta/core/runtime/Symbol.h"
 #include "quanta/core/runtime/TypedArray.h"
@@ -101,10 +102,35 @@ public:
         }
     }
 
-    void visit_object(Object* o) override { mark_edge(o, CellKind::Object); }
-    void visit_string(String* s) override { mark_edge(s, CellKind::String); }
+    void visit_object(Object* o) override { edge_object(o); }
+    void visit_string(String* s) override { edge_string(s); }
     void visit_symbol(Symbol* s) override { mark_edge(s, CellKind::Symbol); }
     void visit_bigint(BigInt* b) override { mark_edge(b, CellKind::BigInt); }
+
+    // The same visits as plain inline members, for Object::trace_fast, which hands this class
+    // its edges without a virtual call between them.
+    [[gnu::always_inline]] void edge_object(Object* o) {
+        Heap::ProbeResult r = Heap::mark_exact_fast(o, CellKind::Object);
+        if (!r.cell) return;
+        marked_cells++;
+        gray_.push_back(r);
+    }
+    [[gnu::always_inline]] void edge_string(String* s) {
+        Heap::ProbeResult r = Heap::mark_string_edge_fast(s);
+        if (!r.cell) return;
+        marked_cells++;
+        // A leaf string (CellKind::FlatString) is marked and finished; only a link has children.
+        if (r.kind == CellKind::String) gray_.push_back(r);
+    }
+    [[gnu::always_inline]] void edge_value(const Value& v) {
+        switch (v.gc_edge_kind()) {
+            case 0: return;
+            case 1: edge_object(v.is_function() ? static_cast<Object*>(v.as_function()) : v.as_object()); return;
+            case 2: edge_string(v.as_string()); return;
+            case 3: mark_edge(v.as_symbol(), CellKind::Symbol); return;
+            default: mark_edge(v.as_bigint(), CellKind::BigInt); return;
+        }
+    }
 
     // Contexts keep the set: there are few of them, and Context has no room
     // for a stamp without growing (its size is asserted).
@@ -220,7 +246,7 @@ public:
     // context/environment work, hence the next caller's re-quiesce). Returns
     // false once truly nothing is left.
     bool step() {
-        drain_contexts_and_environments();
+        if (__builtin_expect(!context_work_.empty() || !environment_work_.empty(), 0)) drain_contexts_and_environments();
         // Marking is memory-bound, not instruction-bound: a live set of a
         // million cells spread over hundreds of megabytes misses to DRAM on
         // nearly every cell, and popping an entry straight off the worklist
@@ -380,7 +406,7 @@ private:
     // Marking from a trace edge, where the kind comes from the edge and the
     // pointer is a cell base -- see Heap::mark_exact.
     void mark_edge(const void* p, CellKind kind) {
-        Heap::ProbeResult r = Heap::mark_exact(p, kind);
+        Heap::ProbeResult r = Heap::mark_exact_fast(p, kind);
         if (!r.cell) return;
         marked_cells++;
         if (r.kind == CellKind::Object || r.kind == CellKind::String) {
@@ -401,9 +427,11 @@ private:
     void trace_cell(const Heap::ProbeResult& p) {
         // Re-arm Collector::write_barrier's mid-major re-trace path: cleared
         // at trace time, not cycle end, so the same cell can re-dirty.
-        if (Collector::major_in_progress_) Heap::clear_remembered(p);
+        if (Collector::major_in_progress_) Heap::clear_remembered_fast(p);
         if (p.kind == CellKind::Object) {
-            static_cast<Object*>(p.cell)->trace(*this);
+            Object* o = static_cast<Object*>(p.cell);
+            if (__builtin_expect(o->traces_by_default(), 1)) o->trace_fast(*this);
+            else o->trace(*this);
         } else {
             static_cast<String*>(p.cell)->gc_trace(*this);
         }
@@ -912,7 +940,8 @@ size_t run_sweep(bool minor) {
                 }
                 break;
             }
-            case CellKind::String: static_cast<String*>(d.cell)->~String(); break;
+            case CellKind::String:
+            case CellKind::FlatString: static_cast<String*>(d.cell)->~String(); break;
             case CellKind::Symbol: static_cast<Symbol*>(d.cell)->~Symbol(); break;
             case CellKind::BigInt: static_cast<BigInt*>(d.cell)->~BigInt(); break;
             default: break;
@@ -941,6 +970,10 @@ void run_verify(Collector::CycleStats& stats) {
         if (!marked) return;
         if (kind == CellKind::Object) static_cast<Object*>(cell)->trace(check);
         else if (kind == CellKind::String) static_cast<String*>(cell)->gc_trace(check);
+        else if (kind == CellKind::FlatString && static_cast<String*>(cell)->is_link()) {
+            std::fprintf(stderr, "[gc-verify] link string allocated as a leaf cell %p\n", cell);
+            check.violations++;
+        }
     });
     stats.verify_violations = check.violations;
 }

@@ -118,6 +118,10 @@ void Object::trace_default(Visitor& v) {
         uint32_t scount = shape_->slot_count();
         for (uint32_t i = 0; i < scount; i++) v.visit(*shape_slot_ptr(i));
     }
+    trace_extras(v);
+}
+
+void Object::trace_extras(Visitor& v) {
     // One walk to the extras, not three: all three of these live in the same
     // block, and an object that has none -- which is most of them -- used to
     // pay the trip to find that out once per question.
