@@ -2068,6 +2068,9 @@ struct Frame {
     // Whether a call made from this frame may run as a stackless one: only an activation the
     // interpreter itself is driving (not one the baseline JIT steps through).
     bool inline_ok = false;
+    // A stackless frame of an environment-mode function: popping it releases the call
+    // environment, restores the context's strictness and `this`, and drops its two roots.
+    bool env_call = false;
 };
 
 // The permanent form of the diagnostic's frame_lex_env_diag(f): falls back
@@ -2251,11 +2254,23 @@ namespace {
 
 constexpr uint32_t kInlineMaxRegs = 32;
 
+// What an environment-mode frame owes when it ends: the environment it made, the context state
+// it replaced (the tree-walker pieces a body may delegate to read strictness and `this` from the
+// context), and the two collector roots on its current environments.
+struct InlineEnvState {
+    Environment* call_env;
+    Value saved_this;
+    Context* prev_context;
+    bool saved_strict;
+    alignas(EnvironmentRoot) unsigned char roots[2][sizeof(EnvironmentRoot)];
+};
+
 struct InlineSlot {
     alignas(Frame) unsigned char frame_storage[sizeof(Frame)];
     CallInfo call_info;
     Environment* env_saves[64];
     Environment* resolved_envs[8];
+    InlineEnvState env;
     Frame& frame() { return *reinterpret_cast<Frame*>(frame_storage); }
 };
 
@@ -2311,7 +2326,30 @@ constexpr uint32_t inline_frame_words(uint32_t regs) { return 2 + ((regs + 3) & 
 }
 
 // Takes a stackless frame off the arena and the call stack, and tells its activation's base.
+// Ends an environment-mode frame's own state: what call_default_impl does after VM::run for the
+// same kind of call -- the roots, the environments (those that escaped go to the survivors), the
+// context's strictness and `this`.
+[[gnu::noinline]] void inline_env_release(Frame& f) {
+    InlineSlot& slot = *reinterpret_cast<InlineSlot*>(&f);
+    InlineEnvState& st = slot.env;
+    reinterpret_cast<EnvironmentRoot*>(st.roots[1])->~EnvironmentRoot();
+    reinterpret_cast<EnvironmentRoot*>(st.roots[0])->~EnvironmentRoot();
+    Context& ctx = *f.ctx;
+    for (Environment* e = f.current_lexical_env; e && e != st.call_env;) {
+        Environment* outer = e->get_outer();
+        if (!e->is_escaped()) Collector::release_env(e);
+        else if (Engine* eng = ctx.get_engine()) eng->add_survivor_environment(e);
+        e = outer;
+    }
+    if (!st.call_env->is_escaped()) Collector::release_env(st.call_env);
+    else if (Engine* eng = ctx.get_engine()) eng->add_survivor_environment(st.call_env);
+    Object::current_context_ = st.prev_context;
+    ctx.set_strict_mode(st.saved_strict);
+    ctx.set_this_value(st.saved_this);
+}
+
 [[gnu::always_inline]] inline void inline_frame_pop(Frame& f) {
+    if (UNLIKELY(f.env_call)) inline_env_release(f);
     Frame* c = f.caller;
     f.base->active = (c == f.base) ? nullptr : c;
     g_arena.top -= f.value_words;
@@ -2326,6 +2364,7 @@ constexpr uint8_t kInlineNever = 1;
 constexpr uint8_t kInlineOk = 2;
 constexpr uint8_t kInlineStrict = 4;      // the callee runs strict
 constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (it boxes a primitive)
+constexpr uint8_t kInlineEnv = 16;        // an environment-mode callee (inline_call_enter_env)
 
 [[gnu::noinline]] uint8_t inline_classify(const FunctionExecutable& exe, const BytecodeChunk& chunk, Function* fn) {
     // jit_state 0 is "not decided yet": ask again next call. Once the JIT has refused the chunk
@@ -2336,6 +2375,12 @@ constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (
     if (chunk.jit_state == 2 && !chunk.env_mode && chunk.register_count <= kInlineMaxRegs && !fn->is_arrow() &&
         !exe.fast_uses_super && !exe.fast_leaf) {
         v = kInlineOk | (strict ? kInlineStrict : 0) | (exe.fast_uses_this ? kInlineWantsThis : 0);
+    } else if (chunk.jit_state == 2 && chunk.env_mode && chunk.env && chunk.register_count <= kInlineMaxRegs &&
+               exe.fast_env_gate && exe.fast_no_closures && !fn->is_arrow() && !exe.fast_uses_super) {
+        // An environment-mode function whose bindings can be laid down by index. The keys are
+        // interned by the first call through the ordinary path, so until then: not decided.
+        if (!chunk.env->env_keys_ready) return 0;
+        if (chunk.env->env_seed_ok) v = kInlineOk | kInlineEnv | (strict ? kInlineStrict : 0);
     }
     chunk.inline_state = v;
     return v;
@@ -2359,6 +2404,121 @@ constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (
     }
 }
 
+// inline_call_enter for an environment-mode callee (one that needs a call environment of its own
+// and creates no closures). It does what call_default_impl's fast environment path does around
+// VM::run, with the undoing deferred to inline_env_release: the call environment is made and
+// seeded, the context's strictness and `this` are replaced (a body may delegate pieces to the
+// tree-walker, which reads them from the context), the two environment roots are registered.
+// Returns false, with nothing changed, for anything it does not take: a sloppy callee given a
+// primitive `this`, a constructor call, another realm, or an environment that cannot be seeded
+// by index.
+[[gnu::noinline]] bool inline_call_enter_env(Frame& f, Function* fn, const FunctionExecutable& exe,
+                                              const BytecodeChunk& chunk, const Value* argv, uint32_t argc,
+                                              const Value& this_value, uint32_t return_pc, Frame*& out,
+                                              uint8_t verdict) {
+    Context& ctx = *f.ctx;
+    if (UNLIKELY(exe.owner_realm() != g_current_realm || !fn->fast_env_callable() ||
+                 (ctx.is_in_constructor_call() && !ctx.get_new_target().is_undefined()))) {
+        return false;
+    }
+    const bool strict = (verdict & kInlineStrict) != 0;
+    Value actual_this = this_value;
+    if (!strict) {
+        if (this_value.is_undefined() || this_value.is_null()) {
+            Object* global = ctx.get_global_this();
+            if (!global) return false;
+            actual_this = Value(global);
+        } else if (!this_value.is_object() && !this_value.is_function()) {
+            return false;   // ToObject of a primitive: the general path boxes it
+        }
+    }
+    InlineArena& arena = g_arena;
+    if (UNLIKELY(!arena.values)) {
+        if (!inline_arena_init()) return false;
+    }
+    CallStack& stack = CallStack::instance();
+    const uint32_t nregs = std::max<uint32_t>(chunk.register_count, chunk.parameter_count);
+    const uint32_t words = inline_frame_words(nregs);
+    if (UNLIKELY(stack.depth() + 1 >= CallStack::MAX_STACK_DEPTH || arena.top + words > arena.limit)) return false;
+
+    Environment* outer_env = fn->get_closure_environment();
+    if (!outer_env && fn->get_closure_context()) outer_env = fn->get_closure_context()->get_lexical_environment();
+    if (!outer_env) outer_env = ctx.get_lexical_environment();
+
+    // The environment, seeded before anything is committed: if it cannot be laid down by index
+    // it is simply dropped again.
+    const auto& plan = chunk.env->env_seed_plan;
+    Environment* call_env = new Environment(Environment::Type::Function, outer_env);
+    call_env->reserve_slots(chunk.env->env_slot_total);
+    if (UNLIKELY(!call_env->fresh_with_room(plan.size()))) {
+        delete call_env;
+        return false;
+    }
+    {
+        size_t at = 0;
+        for (const auto& se : plan) {
+            Environment::BindingSlot slot{Value(), true, true, false};
+            if (se.param_index >= 0) {
+                if (static_cast<uint32_t>(se.param_index) < argc) slot.value = argv[se.param_index];
+            } else {
+                slot.mutable_flag = (se.flags & 2) == 0;
+                slot.initialized = (se.flags & 1) == 0;
+                if (se.flags & 2) slot.const_binding = true;
+            }
+            call_env->seed_binding(at++, se.key, slot);
+        }
+    }
+    ctx.consume_pending_construct_call();
+
+    BytecodeChunk::LookupCacheEntry* lookup_cache_data = chunk.lookup_cache.data();
+    PrivateFeedback* private_feedback_data = chunk.ic_feedback ? chunk.ic_feedback->private_feedback.data() : nullptr;
+    if (UNLIKELY(chunk.uses_lookup_cache || private_feedback_data))
+        inline_instance_caches(chunk, fn, lookup_cache_data, private_feedback_data);
+
+    Value* bank = arena.top;
+    Value* regs = bank + 2;
+    bank[0] = actual_this;
+    init_register_bank(reinterpret_cast<unsigned char*>(regs), nregs);
+    const uint32_t copy = std::min<uint32_t>(chunk.parameter_count, argc);
+    for (uint32_t i = 0; i < copy; i++) regs[i] = argv[i];
+    arena.top = bank + words;
+
+    InlineSlot& slot = arena.slots[arena.depth++];
+    slot.call_info.lexical_environment_ = call_env;
+    slot.call_info.variable_environment_ = call_env;
+    Frame* callee = new (slot.frame_storage) Frame{
+        chunk, f.ctx, std::span<const Value>(argv, argc), fn, true, regs, slot.env_saves, slot.resolved_envs,
+        lookup_cache_data, private_feedback_data, chunk.code.data(), chunk.constants.data(), call_env,
+        actual_this, Value(), 0, 0, 0, true};
+    callee->call_info = &slot.call_info;
+    callee->current_lexical_env = call_env;
+    callee->current_variable_env = call_env;
+    callee->osr_budget = INT32_MAX;
+    callee->caller = &f;
+    Frame* base = f.base ? f.base : &f;
+    callee->base = base;
+    callee->return_pc = return_pc;
+    callee->value_words = words;
+    callee->inline_ok = true;
+    callee->env_call = true;
+
+    InlineEnvState& st = slot.env;
+    st.call_env = call_env;
+    st.saved_this = ctx.get_this_value();
+    st.saved_strict = ctx.is_strict_mode();
+    st.prev_context = Object::current_context_;
+    ctx.set_strict_mode(strict);
+    ctx.set_this_value(actual_this);
+    Object::current_context_ = &ctx;
+    new (st.roots[0]) EnvironmentRoot(&callee->current_lexical_env);
+    new (st.roots[1]) EnvironmentRoot(&callee->current_variable_env);
+
+    base->active = callee;
+    stack.push_frame_unchecked(&ctx.get_current_filename(), fn);
+    out = callee;
+    return true;
+}
+
 // Starts a stackless call of `fn` from `f` if everything allows it; true with the callee's
 // frame in `out` (the caller has only to dispatch it), false with nothing touched.
 [[gnu::always_inline]] inline bool inline_call_enter(Frame& f, Function* fn, const Value* argv, uint32_t argc,
@@ -2371,6 +2531,8 @@ constexpr uint8_t kInlineWantsThis = 8;   // a sloppy callee that reads `this` (
         verdict = inline_classify(exe, chunk, fn);
         if (verdict < kInlineOk) return false;
     }
+    if (UNLIKELY(verdict & kInlineEnv))
+        return inline_call_enter_env(f, fn, exe, chunk, argv, argc, this_value, return_pc, out, verdict);
     Context& ctx = *f.ctx;
     // A call that changes the strictness, needs a boxed `this`, or runs in another realm is the
     // general path's. (this_needs_super: an arrow's super lookup, which the callee would not see.)
@@ -2533,8 +2695,20 @@ Value h_LdaConstWide(Frame& f, uint32_t pc, Value acc) {
     DISPATCH();
 }
 
+Value h_ReturnInline(Frame& f, uint32_t pc, Value acc);
+
+// The return of an environment-mode frame: its own state is undone (a call, so it is not
+// folded into h_ReturnInline, which would then save registers on every return), and the rest is
+// the ordinary return.
+[[gnu::noinline]] Value h_ReturnInlineEnv(Frame& f, uint32_t pc, Value acc) {
+    inline_env_release(f);
+    f.env_call = false;   // released; the pop below must not do it again
+    [[clang::musttail]] return h_ReturnInline(f, pc, acc);
+}
+
 [[gnu::noinline]] Value h_ReturnInline(Frame& f, uint32_t pc, Value acc) {
     (void)pc;
+    if (UNLIKELY(f.env_call)) [[clang::musttail]] return h_ReturnInlineEnv(f, pc, acc);
     Frame* const caller = f.caller;
     const uint32_t return_pc = f.return_pc;
     inline_frame_pop(f);
@@ -6435,12 +6609,16 @@ Value h_CallInlineGo(Frame& f, uint32_t pc, Value acc) {
     [[clang::musttail]] return h_CallPlain(f, pc, acc);
 }
 
-Value h_CallInline(Frame& f, uint32_t pc, Value acc) {
+[[gnu::noinline]] Value h_CallInline(Frame& f, uint32_t pc, Value acc) {
     const Value& callee = f.regs[f.code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable()) && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+        if (LIKELY(fn->fast_callable())) {
+            if (fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+                [[clang::musttail]] return h_CallInlineGo(f, pc, acc);
+        } else if (fn->maybe_env_callable() && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever) {
             [[clang::musttail]] return h_CallInlineGo(f, pc, acc);
+        }
     }
     [[clang::musttail]] return h_CallPlain(f, pc, acc);
 }
@@ -6455,12 +6633,16 @@ Value h_CallResolvedInlineGo(Frame& f, uint32_t pc, Value acc) {
     [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
 }
 
-Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc) {
+[[gnu::noinline]] Value h_CallResolvedInline(Frame& f, uint32_t pc, Value acc) {
     const Value& callee = f.regs[f.code[pc + 1]];
     if (LIKELY(callee.is_function())) {
         Function* fn = callee.as_function();
-        if (LIKELY(fn->fast_callable()) && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+        if (LIKELY(fn->fast_callable())) {
+            if (fn->get_executable()->bytecode_chunk->inline_state != kInlineNever)
+                [[clang::musttail]] return h_CallResolvedInlineGo(f, pc, acc);
+        } else if (fn->maybe_env_callable() && fn->get_executable()->bytecode_chunk->inline_state != kInlineNever) {
             [[clang::musttail]] return h_CallResolvedInlineGo(f, pc, acc);
+        }
     }
     [[clang::musttail]] return h_CallResolvedPlain(f, pc, acc);
 }
@@ -9811,33 +9993,40 @@ template <bool Fast>
             for (const auto& p : b.env_params) b.env_param_keys.push_back(Shape::intern(p));
             b.env_local_keys.reserve(b.env_locals.size());
             for (const auto& l : b.env_locals) b.env_local_keys.push_back(Shape::intern(l.name));
-            bool distinct = true;
-            std::vector<const std::string*> every(b.env_param_keys);
-            every.insert(every.end(), b.env_local_keys.begin(), b.env_local_keys.end());
-            for (size_t i = 0; i < every.size() && distinct; i++)
-                for (size_t j = i + 1; j < every.size(); j++)
-                    if (every[i] == every[j]) { distinct = false; break; }
-            b.env_seed_flags.clear();
-            for (const auto& l : b.env_locals)
-                b.env_seed_flags.push_back(static_cast<uint8_t>((l.is_lexical ? 1 : 0) | (l.is_lexical && l.is_const ? 2 : 0)));
-            b.env_seed_ok = distinct && !chunk.env_params_tdz && !chunk.lex_scope_split;
+            b.env_seed_plan.clear();
+            auto find_planned = [&](const std::string* k) -> int {
+                for (size_t i = 0; i < b.env_seed_plan.size(); i++)
+                    if (b.env_seed_plan[i].key == k) return static_cast<int>(i);
+                return -1;
+            };
+            for (size_t i = 0; i < b.env_param_keys.size(); i++) {
+                const int at = find_planned(b.env_param_keys[i]);
+                if (at >= 0) b.env_seed_plan[at].param_index = static_cast<int16_t>(i);
+                else b.env_seed_plan.push_back({b.env_param_keys[i], static_cast<int16_t>(i), 0});
+            }
+            for (size_t i = 0; i < b.env_local_keys.size(); i++) {
+                if (find_planned(b.env_local_keys[i]) >= 0) continue;
+                const auto& l = b.env_locals[i];
+                b.env_seed_plan.push_back({b.env_local_keys[i], static_cast<int16_t>(-1),
+                                           static_cast<uint8_t>((l.is_lexical ? 1 : 0) | (l.is_lexical && l.is_const ? 2 : 0))});
+            }
+            b.env_seed_ok = !chunk.env_params_tdz && !chunk.lex_scope_split;
             b.env_keys_ready = true;
         }
-        if (chunk.env->env_seed_ok &&
-            env->fresh_with_room(chunk.env->env_param_keys.size() + chunk.env->env_local_keys.size())) {
-            // The common case: a fresh call environment and distinct names. Same bindings, same
-            // order and flags as the generic path below, without a lookup per name.
+        if (chunk.env->env_seed_ok && env->fresh_with_room(chunk.env->env_seed_plan.size())) {
+            // The common case: a fresh call environment. Same bindings, same order and flags as
+            // the generic path below, without a lookup per name.
             size_t at = 0;
-            const size_t nparams = chunk.env->env_param_keys.size();
-            for (size_t i = 0; i < nparams; i++) {
-                env->seed_binding(at++, chunk.env->env_param_keys[i],
-                                  Environment::BindingSlot{i < args.size() ? args[i] : Value(), true, true, false});
-            }
-            for (size_t li = 0; li < chunk.env->env_local_keys.size(); li++) {
-                const uint8_t fl = chunk.env->env_seed_flags[li];
-                Environment::BindingSlot slot{Value(), (fl & 2) == 0, (fl & 1) == 0, false};
-                if (fl & 2) slot.const_binding = true;
-                env->seed_binding(at++, chunk.env->env_local_keys[li], slot);
+            for (const auto& se : chunk.env->env_seed_plan) {
+                Environment::BindingSlot slot{Value(), true, true, false};
+                if (se.param_index >= 0) {
+                    if (static_cast<size_t>(se.param_index) < args.size()) slot.value = args[se.param_index];
+                } else {
+                    slot.mutable_flag = (se.flags & 2) == 0;
+                    slot.initialized = (se.flags & 1) == 0;
+                    if (se.flags & 2) slot.const_binding = true;
+                }
+                env->seed_binding(at++, se.key, slot);
             }
         } else if (chunk.env_params_tdz) {
             // Spec FDI ordering: params start uninitialized (their raw values

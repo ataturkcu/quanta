@@ -2112,6 +2112,21 @@ public:
         return executable_ && executable_->fast_gate && !is_native_ && !is_class_constructor_ &&
                get_function_kind() == FunctionKind::Plain;
     }
+    // Whether a call can be run stackless as an environment-mode function (Interpreter.cpp,
+    // inline_call_enter_env): the same plain compiled function, but one whose body needs an
+    // environment of its own that nothing can capture (it makes no closures), and that
+    // is not a method with a home object or private brands -- those bind more into the call
+    // environment than the stackless entry builds.
+    // The cheap part of the above, for the call handlers' screen: the executable's own bits.
+    bool maybe_env_callable() const { return executable_ && executable_->fast_env_gate && !is_native_; }
+    bool fast_env_callable() const {
+        if (!executable_ || !executable_->fast_env_gate || !executable_->fast_no_closures || is_native_ ||
+            is_class_constructor_ || is_arrow_ || is_param_default_ || get_function_kind() != FunctionKind::Plain) {
+            return false;
+        }
+        const ClassSlots& slots = class_slots();
+        return !slots.home_object && !slots.private_brands;
+    }
     Value call_fast_gate(Context& ctx, std::span<const Value> args, Value this_value);
     // Arguments that live in the caller's VM registers, on the same terms
     // call_register_args states: already GC roots, and valid for the whole call.

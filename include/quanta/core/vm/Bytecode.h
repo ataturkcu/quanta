@@ -1128,12 +1128,19 @@ struct BytecodeChunk {
         std::vector<const std::string*> env_local_keys;
         bool env_keys_ready = false;
         // Whether a call environment can be filled by writing the bindings straight into its
-        // empty entries, in order: every name distinct (a repeated parameter name has one
-        // binding holding the last argument), and neither a parameter scope that starts
-        // uninitialised nor a split lexical scope, which each build in a different order.
-        // env_seed_flags has one byte per local: 1 lexical (starts uninitialised), 2 const.
+        // empty entries, in order, instead of creating them one by one: not a parameter scope
+        // that starts uninitialised, nor a split lexical scope, which each build in a different
+        // order. env_seed_plan is what creating them one by one comes to, worked out once: each
+        // distinct name in first-appearance order, a repeated parameter name taking the value of
+        // its last occurrence (the binding holds the last argument of that name), a local that
+        // repeats an earlier name creating nothing.
+        struct SeedEntry {
+            const std::string* key;
+            int16_t param_index;   // the argument it takes, -1 for a local
+            uint8_t flags;         // locals: 1 lexical (starts uninitialised), 2 const
+        };
         bool env_seed_ok = false;
-        std::vector<uint8_t> env_seed_flags;
+        std::vector<SeedEntry> env_seed_plan;
         // Per-iteration Environment locals for one loop/block (Op::EnterLoopEnv).
         // copy_forward: a `for` header's own let/const carries across iterations;
         // everything else starts fresh each time.
